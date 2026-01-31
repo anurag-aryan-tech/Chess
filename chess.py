@@ -27,6 +27,7 @@ class ChessGame:
         self._resize_scheduled = False  # NEW: Prevent recursive triggers
 
         self.matrix = database.matrix
+        self.piece_labels = {}
 
         self.root = self._initialize_window()
         self._setup_window(self.root)
@@ -42,6 +43,8 @@ class ChessGame:
 
         self._make_matrix()
         self._create_chessboard_squares()
+
+        self._update_pieces()
         
         self.root.mainloop()
 
@@ -75,6 +78,9 @@ class ChessGame:
         """Handle resize with debouncing"""
         self._resize_scheduled = False
         self._chessboard_frame_control(width, height)
+        
+        # Refresh piece images with new size
+        self.root.after(100, self._refresh_piece_images)  # Small delay for layout to settle
 
     def _close_button_control(self, window: tk.Tk|ctk.CTk) -> None:
         if window.attributes("-fullscreen"):
@@ -156,5 +162,57 @@ class ChessGame:
                 color, color2 = color2, color
             color, color2 = color2, color
         print("Chessboard squares created!\n")
+
+    def _add_piece_image(self, square: tuple[int, int], piece: str, path: str|None=None) -> None:
+        color = "black" if '-' in piece else "white"
+        path = path if path else f"images/{color}/{piece[:-1]}.png"
+        
+        # Calculate size based on square dimensions
+        square_frame = self.chessboard_squares[square]
+        square_size = min(square_frame.winfo_width(), square_frame.winfo_height())
+        
+        # Fallback to default size if square isn't sized yet
+        if square_size <= 1:
+            image_size = 80  # Default size
+        else:
+            image_size = int(square_size * 0.9)  # 80% of square size
+        
+        # Ensure minimum size
+        image_size = max(image_size, 40)
+        
+        image = utils.ctkimage_generator(path, size=(image_size, image_size))
+        
+        label = ctk.CTkLabel(self.chessboard_squares[square], image=image, text="", 
+                            fg_color="transparent", bg_color="transparent")
+        label.place(relx=0.5, rely=0.5, anchor="center")
+        
+        self.piece_labels[str(square)] = label
+
+    def _remove_piece_image(self, square: tuple[int, int]):
+        label = self.piece_labels[str(square)]
+        label.destroy()
+        self.piece_labels.pop(str(square))
+        
+    def _refresh_piece_images(self):
+        """Update all piece images when window resizes"""
+        # Clear existing labels
+        for label in self.piece_labels.values():
+            label.destroy()
+        self.piece_labels.clear()
+        
+        # Recreate with new sizes
+        self._update_pieces()
+
+    
+        
+    def _update_pieces(self) -> None:
+        matrix = self.matrix if database.current_turn == "white" else np.flipud(self.matrix)
+
+        for i in range(8):
+            for j in range(8):
+                square = (i, j)
+                piece = matrix[i][j]
+                if piece != 0:
+                    self._add_piece_image(square, piece)
 
 ChessGame()

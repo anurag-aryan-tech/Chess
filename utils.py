@@ -56,9 +56,9 @@ class Utilities:
         
         return relx
 
-    def photoimage_generator(self, path: str, size: Tuple[int, int] | None = None) -> ImageTk.PhotoImage:
+    def ctkimage_generator(self, path: str, size: Tuple[int, int] = (70, 70)) -> ctk.CTkImage:
         """
-        Generates a PhotoImage object from the given path.
+        Generate CTkImage from path with transparency support
         
         Args:
             path: Path to the image file.
@@ -67,17 +67,21 @@ class Utilities:
         Returns:
             PhotoImage object.
         """
-        image = Image.open(path)
-        if size:
-            image = image.resize(size)
-        return ImageTk.PhotoImage(image)
+        from PIL import Image
+        
+        img = Image.open(path)
+        # Ensure image has alpha channel for transparency
+        if img.mode != 'RGBA':
+            img = img.convert('RGBA')
+        
+        return ctk.CTkImage(light_image=img, dark_image=img, size=size)
     
 
 class LegalMoves:
     """Class containing methods to calculate legal chess moves for all piece types."""
     
     def __init__(self):
-        pass
+        self.update_legal_moves(database.matrix)
     def search_piece(self, piece: str, matrix: np.ndarray = database.matrix):
         """
         Finds the position of a specific piece on the chess board matrix.
@@ -732,6 +736,5 @@ class LegalMoves:
 
 if __name__ == "__main__":
     utils = Utilities()
-    utils.legal_moves.update_legal_moves()
     for piece, move in database.black_legal_moves.items():
         print(f"{piece}: {list(move)}")

@@ -10,6 +10,9 @@ class Database:
         self.matrix_path = Path("database/matrix.json")
         self.current_turn = "white"
 
+        self.en_passant = ""
+        self.fullmove = 1
+
         self.r1_moved = False
         self.r2_moved = False
         self.k1_moved = False
@@ -61,6 +64,9 @@ class Database:
     def initialize_legal_moves(self):
         self.white_legal_moves = {piece: np.array([]) for piece in self.white_pieces.flatten()}
         self.black_legal_moves = {piece: np.array([]) for piece in self.black_pieces.flatten()}
+
+    def get_legal_moves(self, color: str) -> Dict[str, np.ndarray]:
+        return self.white_legal_moves if color == "white" else self.black_legal_moves
 
 
 database = Database()

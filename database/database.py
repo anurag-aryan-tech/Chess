@@ -67,6 +67,8 @@ class Database:
 
     def get_legal_moves(self, color: str) -> Dict[str, np.ndarray]:
         return self.white_legal_moves if color == "white" else self.black_legal_moves
-
+    
+    def reset(self):
+        self.__init__()
 
 database = Database()

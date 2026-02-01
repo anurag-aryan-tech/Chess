@@ -155,8 +155,18 @@ class Utilities:
         rank = str(8 - row)
 
         return file + rank
+    
+    def next_piece(self, base: str, color: str) -> str:
+        """Returns the next piece for a given color and starting piece type."""
+        maximum = 0
+        prefix = "-" if color == "black" else ""
 
-
+        pieces = database.white_pieces if color == "white" else database.black_pieces
+        for piece in pieces.flatten():
+            if base in piece:
+                maximum = max(maximum, int(piece[-1]))
+        
+        return f"{prefix}{base}{maximum + 1}"
 
 class LegalMoves:
     """Class for calculating legal chess moves for all piece types"""
@@ -863,9 +873,13 @@ class LegalMoves:
         black_pins = self.find_pins("black", matrix)
         database.pins = {**white_pins, **black_pins}
         
-        # Initialize with empty arrays
-        database.white_legal_moves = {piece: np.array([]) for piece in database.white_pieces.flatten()}
-        database.black_legal_moves = {piece: np.array([]) for piece in database.black_pieces.flatten()}
+        # FIX: Initialize ALL pieces including promoted ones
+        # Get all unique pieces from the matrix
+        all_white_pieces = set(database.white_pieces.flatten())
+        all_black_pieces = set(database.black_pieces.flatten())
+        
+        database.white_legal_moves = {piece: np.array([]) for piece in all_white_pieces}
+        database.black_legal_moves = {piece: np.array([]) for piece in all_black_pieces}
         
         # Calculate actual legal moves
         if database.current_turn == "white":

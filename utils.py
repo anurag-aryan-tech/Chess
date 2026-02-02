@@ -167,6 +167,9 @@ class Utilities:
                 maximum = max(maximum, int(piece[-1]))
         
         return f"{prefix}{base}{maximum + 1}"
+    
+    def reset(self):
+        self.legal_moves = LegalMoves()
 
 class LegalMoves:
     """Class for calculating legal chess moves for all piece types"""
@@ -605,6 +608,13 @@ class LegalMoves:
         row, col = self.search_piece(piece, matrix)
         moves = []
         
+        # Find opponent king position
+        opponent_king = "-k1" if color == "white" else "k1"
+        try:
+            opp_king_row, opp_king_col = self.search_piece(opponent_king, matrix)
+        except ValueError:
+            opp_king_row, opp_king_col = -10, -10  # King not on board (shouldn't happen)
+        
         # 8 adjacent squares
         for dr in [-1, 0, 1]:
             for dc in [-1, 0, 1]:
@@ -613,10 +623,15 @@ class LegalMoves:
                 
                 r, c = row + dr, col + dc
                 if 0 <= r < 8 and 0 <= c < 8:
+                    # ✅ NEW: Check if square is adjacent to opponent king
+                    king_distance = max(abs(r - opp_king_row), abs(c - opp_king_col))
+                    if king_distance <= 1:
+                        continue  # Can't move next to opponent king
+                    
                     if not self.is_occupied(matrix[r, c]) or self.is_enemy(matrix[r, c], color):
                         moves.append((r, c))
         
-        # Castling (same as before)
+        # Castling logic (keep as is)
         if color == "white":
             castle_checks = [(database.r1_moved, database.k1_moved), (database.r2_moved, database.k1_moved)]
             rook_pieces = ["r1", "r2"]
@@ -638,7 +653,7 @@ class LegalMoves:
                     if self.can_castle(color, castle_range, matrix):
                         moves.append((row_castle, castle_col))
         
-        # NEW APPROACH: Filter using simple attack checking (no recursive king moves)
+        # Filter using attack checking (existing code)
         safe_moves = []
         opponent_color = "black" if color == "white" else "white"
         
@@ -666,9 +681,6 @@ class LegalMoves:
                         continue
                     
                     # Calculate pseudo-legal moves for this piece
-                    piece_type = str(opponent_piece).strip('-')[0]
-                    
-                    # Simple attack check based on piece type
                     if self._can_piece_attack(opponent_piece, (r, c), move, temp_matrix):
                         is_safe = False
                         break

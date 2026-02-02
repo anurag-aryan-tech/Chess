@@ -36,7 +36,6 @@ class ChessGame:
         self._resize_scheduled = False
         
         # Game state
-        self.matrix = database.matrix
         self.promoting = False
         self.promoting_square: Optional[Tuple[int, int]] = None
         self.piece_selected: Optional[str] = None
@@ -64,6 +63,10 @@ class ChessGame:
         self._render_all_pieces()
         
         self.root.mainloop()
+
+    @property
+    def matrix(self):
+        return database.matrix
 
     # ==================== WINDOW MANAGEMENT ====================
     
@@ -113,7 +116,12 @@ class ChessGame:
         """Handle window close event"""
         answer = messagebox.askyesno("Warning", "Are you sure you want to close the game?")
         if answer:
-            self.root.destroy()
+            try:
+                self.root.quit()  # Stop mainloop first
+                self.root.destroy()  # Then destroy window
+            except Exception as e:
+                # Window already destroyed or other error
+                print(f"Close error (safe to ignore): {e}")
             print("Game closed!")
 
     # ==================== CLOSE BUTTON MANAGEMENT ====================
@@ -347,6 +355,10 @@ class ChessGame:
     
     def _get_legal_moves_for_piece(self, piece: str) -> np.ndarray:
         """Get legal moves for a specific piece"""
+        # Safety check
+        if not piece or piece == 0 or not isinstance(piece, str):
+            return np.array([])
+        
         color = "white" if '-' not in piece else "black"
         legal_moves_dict = database.get_legal_moves(color)
         return legal_moves_dict.get(piece, np.array([]))
@@ -360,6 +372,10 @@ class ChessGame:
     
     def _is_legal_move(self, piece: str, target_square: Tuple[int, int]) -> bool:
         """Check if a move is legal for the given piece"""
+        # Safety check
+        if not piece or piece == 0 or not isinstance(piece, str):
+            return False
+        
         legal_moves = self._get_legal_moves_for_piece(piece)
         return any(np.array_equal(target_square, move) for move in legal_moves)
     
@@ -413,13 +429,7 @@ class ChessGame:
             self._refresh_all_images()
 
     def _show_game_over_dialog(self, result: str, winner: Optional[str] = None):
-        """
-        Show game over dialog
-        
-        Args:
-            result: "checkmate" or "stalemate"
-            winner: "white", "black", or None for stalemate
-        """
+        """Show game over dialog"""
         # Create semi-transparent overlay
         overlay = ctk.CTkFrame(
             self.root, 
@@ -428,17 +438,33 @@ class ChessGame:
         )
         overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
         
+        # ✅ Calculate responsive sizing
+        screen_width = self.root.winfo_width()
+        screen_height = self.root.winfo_height()
+        
+        # Use percentage but with min/max constraints
+        dialog_width = max(300, min(int(screen_width * 0.5), 600))  # 50% of screen, min 300px, max 600px
+        dialog_height = max(250, min(int(screen_height * 0.4), 400))  # 40% of screen, min 250px, max 400px
+        
         # Create dialog box
         dialog = ctk.CTkFrame(
             overlay,
             fg_color=("white", "gray10"),
             corner_radius=20,
             border_width=2,
-            border_color=("gold" if result == "checkmate" else "gray")
+            border_color=("gold" if result == "checkmate" else "gray"),
+            width=dialog_width,
+            height=dialog_height
         )
-        dialog.place(relx=0.5, rely=0.5, anchor="center", relwidth=0.4, relheight=0.35)
+        dialog.place(relx=0.5, rely=0.5, anchor="center")
         
-        # Title
+        # ✅ Make dialog resize-aware
+        dialog.pack_propagate(False)  # Don't let content resize the dialog
+        
+        # Title - use responsive font
+        title_font_size = max(20, min(int(screen_height * 0.04), 32))
+        subtitle_font_size = max(16, min(int(screen_height * 0.03), 24))
+        
         if result == "checkmate":
             title = "👑 CHECKMATE! 👑"
             subtitle = f"{winner.capitalize()} Wins!" if winner else ""
@@ -447,69 +473,146 @@ class ChessGame:
             subtitle = "Game Drawn"
         
         title_label = ctk.CTkLabel(
-            dialog,
-            text=title,
-            font=("Arial Bold", 32)
+            dialog, 
+            text=title, 
+            font=("Arial Bold", title_font_size),
+            wraplength=dialog_width - 40  # ✅ Wrap text if needed
         )
-        title_label.pack(pady=(30, 10))
+        title_label.pack(pady=(20, 10))
         
         subtitle_label = ctk.CTkLabel(
-            dialog,
-            text=subtitle,
-            font=("Arial", 24)
+            dialog, 
+            text=subtitle, 
+            font=("Arial", subtitle_font_size),
+            wraplength=dialog_width - 40
         )
-        subtitle_label.pack(pady=(0, 30))
+        subtitle_label.pack(pady=(0, 20))
         
         # Button frame
         button_frame = ctk.CTkFrame(dialog, fg_color="transparent")
-        button_frame.pack(pady=20)
+        button_frame.pack(pady=10, expand=True)
+        
+        # ✅ Responsive button sizing
+        button_width = max(100, min(int(dialog_width * 0.3), 140))
+        button_height = max(30, min(int(dialog_height * 0.12), 40))
+        button_font_size = max(12, min(int(screen_height * 0.02), 16))
         
         # New Game button
         new_game_btn = ctk.CTkButton(
             button_frame,
             text="New Game",
-            font=("Arial", 16),
-            width=140,
-            height=40,
+            font=("Arial", button_font_size),
+            width=button_width,
+            height=button_height,
             command=lambda: self._start_new_game(overlay)
         )
-        new_game_btn.grid(row=0, column=0, padx=10)
+        new_game_btn.grid(row=0, column=0, padx=10, pady=5)
         
         # View Board button
         view_board_btn = ctk.CTkButton(
             button_frame,
             text="View Board",
-            font=("Arial", 16),
-            width=140,
-            height=40,
+            font=("Arial", button_font_size),
+            width=button_width,
+            height=button_height,
             fg_color="transparent",
             border_width=2,
-            command=lambda: overlay.destroy()
+            command=lambda: self._view_board_with_menu(overlay, result, winner)
         )
-        view_board_btn.grid(row=0, column=1, padx=10)
+        view_board_btn.grid(row=0, column=1, padx=10, pady=5)
+
+    def _view_board_with_menu(self, overlay: ctk.CTkFrame, result: str, winner: Optional[str] = None):
+        """Hide dialog but keep overlay with floating menu button"""
+        overlay.destroy()
+        
+        # ✅ Create a small floating button in corner
+        menu_button = ctk.CTkButton(
+            self.root,
+            text="⚙ Menu",
+            font=("Arial", 14),
+            width=100,
+            height=40,
+            command=lambda: self._show_game_over_dialog(result, winner)
+        )
+        menu_button.place(relx=0.88, rely=0.92, anchor="center")
+        
+        # Store reference so we can clean it up
+        self._game_over_menu_btn = menu_button
+
 
     def _start_new_game(self, overlay: ctk.CTkFrame) -> None:
-        """Start a new game"""
+        """Start a new game by resetting state"""
+        global utils
+        
         overlay.destroy()
+        
+        # ✅ Clean up floating menu button if it exists
+        if hasattr(self, '_game_over_menu_btn'):
+            self._game_over_menu_btn.destroy()
+            del self._game_over_menu_btn
+        
+        # Reset database first
         database.reset()
-        self.__init__()
+        utils = Utilities()
+        
+        # Reset game state
+        self.promoting = False
+        self.promoting_square = None
+        self.piece_selected = None
+        self._legal_moves_update_scheduled = False
+        
+        # Clear ALL UI elements (pieces AND indicators)
+        self._clear_all_pieces()
+        self._clear_all_legal_move_indicators()
+        
+        # Clear promotion labels
+        for label in self.promotion_labels.values():
+            label.configure(image=None)
+        
+        # Re-render board with starting position
+        self._render_all_pieces()
+        
+        # Update legal moves for new position
+        utils.legal_moves.update_legal_moves(self.matrix)
+    
+        # ✅ DEBUG: Print to verify
+        print(f"Matrix : {self.matrix}")
+        
+        print("New game started!\n")
+        
+        print("New game started!\n")
 
 
     def _execute_move(self, from_square: Tuple[int, int], to_square: Tuple[int, int]) -> None:
         """Execute a piece move on the board"""
         piece = self.matrix[from_square[0], from_square[1]]
         
+        #  Safety check - ensure we have a valid piece
+        if piece == 0 or not isinstance(piece, str):
+            print("Error: No piece at source square")
+            self.piece_selected = None
+            self._clear_all_legal_move_indicators()
+            return
+        
         # Validate move
         if not self._is_legal_move(piece, to_square):
             return
         
         if "p" in piece and to_square[0] in [0, 7]:
+            self.matrix[from_square[0], from_square[1]] = 0
+
+            # Switch turn
+            database.current_turn = "black" if database.current_turn == "white" else "white"
+            if database.current_turn == "white":
+                database.fullmove += 1
+
             if "-" in piece:
                 database.black_last_pawn = None
                 self._start_promotion("black", to_square)
             else:
                 database.white_last_pawn = None
                 self._start_promotion("white", to_square)
+            return  # Don't continue - promotion will handle the rest
 
         # Castling Logic
         if "k" in piece:
@@ -582,6 +685,31 @@ class ChessGame:
         """Update legal moves after delay"""
         utils.legal_moves.update_legal_moves(self.matrix)
         self._legal_moves_update_scheduled = False
+        
+        #  NEW: Check for game over AFTER legal moves are updated
+        self._check_game_over()
+
+    def _check_game_over(self) -> None:
+        """Check if game is over (checkmate or stalemate)"""
+        if database.current_turn == "white":
+            # Count total legal moves for white
+            total_moves = sum(len(moves) for moves in database.white_legal_moves.values())
+            
+            if total_moves == 0:
+                if utils.legal_moves.check_checker("white"):
+                    self._show_game_over_dialog("checkmate", "black")
+                else:
+                    self._show_game_over_dialog("stalemate")
+        else:
+            # Count total legal moves for black
+            total_moves = sum(len(moves) for moves in database.black_legal_moves.values())
+            
+            if total_moves == 0:
+                if utils.legal_moves.check_checker("black"):
+                    self._show_game_over_dialog("checkmate", "white")
+                else:
+                    self._show_game_over_dialog("stalemate")
+
     
     def _handle_square_click(self, square: Tuple[int, int]) -> None:
         """Handle click on a chessboard square"""
@@ -592,11 +720,11 @@ class ChessGame:
         
         # Determine piece color if square is occupied
         piece_color = None
-        if piece != 0:
+        if piece != 0 and isinstance(piece, str):
             piece_color = "white" if '-' not in piece else "black"
         
         # Case 1: Clicking on own piece - select it and show legal moves
-        if piece != 0 and piece_color == database.current_turn:
+        if piece != 0 and isinstance(piece, str) and piece_color == database.current_turn:
             self.piece_selected = piece
             legal_moves = self._get_legal_moves_for_piece(piece)
             
@@ -605,26 +733,21 @@ class ChessGame:
         
         # Case 2: Clicking on empty square or opponent piece - try to move
         else:
-            if self.piece_selected:
-                from_square = utils.legal_moves.search_piece(self.piece_selected)
-                self._execute_move(from_square, square)
+            if self.piece_selected and isinstance(self.piece_selected, str):
+                try:
+                    # ✅ Verify the piece still exists on the board
+                    from_square = utils.legal_moves.search_piece(self.piece_selected, self.matrix)
+                    self._execute_move(from_square, square)
+                except ValueError as e:
+                    # Piece no longer exists - just clear selection
+                    print(f"Piece not found (probably from old game): {e}")
+                    self.piece_selected = None
+                    self._clear_all_legal_move_indicators()
+                    return  # ✅ Return early instead of continuing
             
             # Deselect and clear indicators
             self.piece_selected = None
             self._clear_all_legal_move_indicators()
-
-        if database.current_turn == "white":
-            if len(database.white_legal_moves) == 0:
-                if utils.legal_moves.check_checker("white"):
-                    self._show_game_over_dialog("checkmate", "black")
-                else:
-                    self._show_game_over_dialog("stalemate")
-        else:
-            if len(database.black_legal_moves) == 0:
-                if utils.legal_moves.check_checker("black"):
-                    self._show_game_over_dialog("checkmate", "white")
-                else:
-                    self._show_game_over_dialog("stalemate")
 
 
 if __name__ == "__main__":

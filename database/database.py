@@ -62,6 +62,7 @@ class Database:
         self.matrix = np.array(matrix['matrix'])
 
     def initialize_legal_moves(self):
+
         self.white_legal_moves = {piece: np.array([]) for piece in self.white_pieces.flatten()}
         self.black_legal_moves = {piece: np.array([]) for piece in self.black_pieces.flatten()}
 
@@ -70,5 +71,7 @@ class Database:
     
     def reset(self):
         self.__init__()
+        
+        print("Database reset!\n")
 
 database = Database()

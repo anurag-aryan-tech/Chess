@@ -630,20 +630,41 @@ class ChessGame:
             if "p" in piece and to_square[0] not in [0, 7]:
                 distance = abs(from_square[0] - to_square[0])
                 diagonal: bool = abs(from_square[1] - to_square[1]) == 1
-                if diagonal and utils.matrix_to_chess(to_square) in database.en_passant:
-                    direction = -1 if "-" in piece else 1
-                    self.matrix[to_square[0] + direction, to_square[1]] = 0
+                
+                # En passant capture
+                print(f"En passant: {database.en_passant}")
+                print(f"To square: {utils.matrix_to_chess(to_square)}")
+                if diagonal and database.en_passant and utils.matrix_to_chess(to_square) == database.en_passant:
+                    # Remove the captured pawn (it's on the same row as from_square)
+                    self.matrix[from_square[0], to_square[1]] = 0
+                    # Clear en passant
+                    # database.en_passant = ""
+                    if "-" in piece:
+                        database.white_last_pawn = None
+                    else:
+                        database.black_last_pawn = None
+                
+                # Double pawn push
                 elif distance == 2:
                     if "-" in piece:
                         database.black_last_pawn = to_square
+                        en_passant_square = (to_square[0] - 1, to_square[1])
+                        database.en_passant = utils.matrix_to_chess(en_passant_square)
                     else:
                         database.white_last_pawn = to_square
+                        en_passant_square = (to_square[0] + 1, to_square[1])
+                        database.en_passant = utils.matrix_to_chess(en_passant_square)
+
+                # Regular pawn move
                 else:
+                    database.en_passant = ""
                     if "-" in piece:
                         database.black_last_pawn = None
                     else:
                         database.white_last_pawn = None
             else:
+                # Non-pawn moves clear en passant
+                database.en_passant = ""
                 if "-" in piece:
                     database.black_last_pawn = None
                 else:
@@ -680,6 +701,7 @@ class ChessGame:
         if not self._legal_moves_update_scheduled:
             self._legal_moves_update_scheduled = True
             self.root.after(100, self._delayed_legal_moves_update)
+        print(f"En passant: {database.en_passant}\n")
 
     def _delayed_legal_moves_update(self) -> None:
         """Update legal moves after delay"""

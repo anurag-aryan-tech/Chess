@@ -681,11 +681,6 @@ class LegalMovesEngine:
                 if opp_row == row and abs(opp_col - col) == 1:
                     target_square = (row + direction, opp_col)
                     moves.append(target_square)
-                    database.en_passant = self.coords.matrix_to_chess(target_square)
-                else:
-                    database.en_passant = ""
-            else:
-                database.en_passant = ""
         
         moves = self.check_allowed_moves(moves, color, matrix)
         return moves

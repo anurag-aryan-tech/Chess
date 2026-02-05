@@ -609,9 +609,12 @@ class ChessGame:
             if "-" in piece:
                 database.black_last_pawn = None
                 self._start_promotion("black", to_square)
+                database.black_pieces = database.black_pieces[database.black_pieces != piece]
             else:
                 database.white_last_pawn = None
                 self._start_promotion("white", to_square)
+                database.white_pieces = database.white_pieces[database.white_pieces != piece]
+
             return  # Don't continue - promotion will handle the rest
 
         # Castling Logic
@@ -632,8 +635,6 @@ class ChessGame:
                 diagonal: bool = abs(from_square[1] - to_square[1]) == 1
                 
                 # En passant capture
-                print(f"En passant: {database.en_passant}")
-                print(f"To square: {utils.matrix_to_chess(to_square)}")
                 if diagonal and database.en_passant and utils.matrix_to_chess(to_square) == database.en_passant:
                     # Remove the captured pawn (it's on the same row as from_square)
                     self.matrix[from_square[0], to_square[1]] = 0

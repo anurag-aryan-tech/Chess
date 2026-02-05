@@ -88,8 +88,8 @@ Full support for advanced chess mechanics:
 |:---:|:---:|:---:|
 | ![Main Game](screenshots/main-game.png) | ![Legal Moves](screenshots/legal-moves.png) | ![Promotion](screenshots/promotion.png) |
 
-### Live Gameplay
-![Gameplay Animation](docs/gameplay.gif)
+<!-- ### Live Gameplay -->
+<!-- ![Gameplay Animation](docs/gameplay.gif) -->
 
 </div>
 

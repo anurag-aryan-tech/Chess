@@ -575,7 +575,7 @@ class ChessGame:
         # Update legal moves for new position
         utils.legal_moves.update_legal_moves(self.matrix)
     
-        # ✅ DEBUG: Print to verify
+        # DEBUG: Print to verify
         print(f"Matrix : {self.matrix}")
         
         print("New game started!\n")
@@ -702,7 +702,6 @@ class ChessGame:
         if not self._legal_moves_update_scheduled:
             self._legal_moves_update_scheduled = True
             self.root.after(100, self._delayed_legal_moves_update)
-        print(f"En passant: {database.en_passant}\n")
 
     def _delayed_legal_moves_update(self) -> None:
         """Update legal moves after delay"""

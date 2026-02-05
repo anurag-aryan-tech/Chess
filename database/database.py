@@ -1,6 +1,6 @@
 """
 Chess Game Database Module
-Manages game state, board position, and piece tracking.
+Manages game state, board position, and piece tracking for a chess game.
 """
 
 import json

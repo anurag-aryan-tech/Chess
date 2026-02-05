@@ -1,6 +1,6 @@
 """
 Chess Game Utilities Module
-Provides UI utilities, coordinate conversions, FEN generation, and legal move calculation.
+Provides UI utilities, coordinate conversions, FEN generation, and legal moves calculation.
 """
 
 import tkinter as tk

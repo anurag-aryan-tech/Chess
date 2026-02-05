@@ -1,4 +1,4 @@
-# chess.py - Complete refactored version
+# chess.py - The Game Entrance
 
 import tkinter as tk
 from tkinter import messagebox

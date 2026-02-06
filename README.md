@@ -6,7 +6,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.14+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)](LICENSE)
-[![Status](https://img.shields.io/badge/status-active-success?style=for-the-badge)](https://github.com/your-username/python-chess-game)
+[![Status](https://img.shields.io/badge/status-active-success?style=for-the-badge)](https://github.com/anurag-aryan-tech/Chess)
 
 ![Chess Game Screenshot](screenshots/main-game.png)
 
@@ -107,8 +107,8 @@ Before you begin, ensure you have:
 
 1️⃣ **Clone the repository**
 ```bash
-git clone https://github.com/your-username/python-chess-game.git
-cd python-chess-game
+git clone https://github.com/anurag-aryan-tech/Chess.git
+cd Chess
 ```
 
 2️⃣ **Install dependencies**
@@ -255,7 +255,7 @@ User Click → GUI (chess.py) → Validate Move (utils.py) → Update State (dat
 | Opening book integration | 🔮 Future | Low |
 | Custom board themes | 📋 Planned | Low |
 
-> 💡 Have an idea? [Open an issue](https://github.com/your-username/python-chess-game/issues) to suggest features!
+> 💡 Have an idea? [Open an issue](https://github.com/anurag-aryan-tech/Chess/issues) to suggest features!
 
 ### 🚀 Completed Features
 
@@ -281,7 +281,7 @@ Contributions make the open-source community an amazing place to learn and creat
 - 📝 Write clear, descriptive commit messages
 - 🧪 Test your changes thoroughly before submitting
 - 📚 Update documentation if needed
-- 🐛 Report bugs via [GitHub Issues](https://github.com/your-username/python-chess-game/issues)
+- 🐛 Report bugs via [GitHub Issues](https://github.com/anurag-aryan-tech/Chess/issues)
 
 ---
 
@@ -314,6 +314,6 @@ Special thanks to:
 
 **Made with ♥️ and Python**
 
-[Report Bug](https://github.com/your-username/python-chess-game/issues) • [Request Feature](https://github.com/your-username/python-chess-game/issues) • [Documentation](https://github.com/your-username/python-chess-game/wiki)
+[Report Bug](https://github.com/anurag-aryan-tech/Chess/issues) • [Request Feature](https://github.com/anurag-aryan-tech/Chess/issues) • [Documentation](https://github.com/anurag-aryan-tech/Chess/wiki)
 
 </div>

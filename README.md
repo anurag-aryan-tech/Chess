@@ -246,7 +246,7 @@ User Click → GUI (chess.py) → Validate Move (utils.py) → Update State (dat
 | Feature | Status | Priority |
 |---------|--------|----------|
 | Move history with undo/redo | 📋 Planned | High |
-| Board Flip per move for ease | 📋 Planned | High |
+| Board Flip per move for ease | ✅ Done | High |
 | PGN import/export | 📋 Planned | High |
 | AI opponent (Minimax/Alpha-Beta) | 🔮 Future | Medium |
 | Online multiplayer | 🔮 Future | Medium |
@@ -256,6 +256,10 @@ User Click → GUI (chess.py) → Validate Move (utils.py) → Update State (dat
 | Custom board themes | 📋 Planned | Low |
 
 > 💡 Have an idea? [Open an issue](https://github.com/your-username/python-chess-game/issues) to suggest features!
+
+### 🚀 Completed Features
+
+- [x] Board Flip per move
 
 ---
 

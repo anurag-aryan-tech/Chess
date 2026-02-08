@@ -20,6 +20,17 @@ class STYLE_CONFIG:
     close_button_fg: str = "transparent"
     close_button_hvr: str = "red"
     promotion_frame_color: str = "gray"
+    resign_width: int = 1  # Base width in square units (1 = width of one square)
+    resign_hover_width: int = 2  # Hover width in square units
+    resign_fg_color: str = "transparent"
+    resign_hover_color: str = "green"
+    settings_width: int = 1  # Base width in square units
+    settings_hover_width: int = 2  # Hover width in square units
+    settings_fg_color: str = "transparent"
+    settings_hover_color: str = "blue"
+    flip_width: int = 1  # Base width in square units
+    flip_fg_color: str = "transparent"
+    flip_hover_color: str = "lightyellow"
 
 
 class ChessGame:
@@ -41,7 +52,9 @@ class ChessGame:
         self.promoting_square: Optional[Tuple[int, int]] = None
         self.piece_selected: Optional[str] = None
         self._legal_moves_update_scheduled = False
+        self.flip_allowed = True
         self.flipped = False
+        self.settings_open = False
         
         # UI elements
         self.piece_labels: Dict[str, ctk.CTkLabel] = {}
@@ -58,6 +71,9 @@ class ChessGame:
         # Create chessboard
         self.chessboard_frame = self._create_chessboard_frame()
         self.promotion_frame = self._create_promotion_frame()
+        self.resign_button = self._create_resign_button()
+        self.settings_button = self._create_settings_button()
+        self.flip_button = self._create_flip_button()
         self.root.update_idletasks()
         self._update_chessboard_position()
         self._configure_grid()
@@ -77,8 +93,11 @@ class ChessGame:
         """Initialize the main window with bindings"""
         root = ctk.CTk()
         root.title(title)
+
+        root.bind("<s>", lambda _: self._show_settings_overlay())
         root.bind("<Escape>", lambda _: self._handle_escape())
         root.bind("<Configure>", lambda event: self._handle_window_resize(event))
+
         root.protocol("WM_DELETE_WINDOW", self._handle_close)
         return root
     
@@ -150,7 +169,8 @@ class ChessGame:
     
     def _toggle_close_button(self) -> None:
         """Show/hide close button based on fullscreen state"""
-        if self.root.attributes("-fullscreen"):
+        self.root.update_idletasks()
+        if not self.root.attributes("-fullscreen"):
             self._add_close_button()
         else:
             self._remove_close_button()
@@ -162,6 +182,7 @@ class ChessGame:
         frame = ctk.CTkFrame(self.root, fg_color="white")
         print("Chessboard frame created!")
         return frame
+    
     def _create_promotion_frame(self) -> ctk.CTkFrame:
         """Create the promotion frame"""
         frame = ctk.CTkFrame(self.root, fg_color=self.style.promotion_frame_color)
@@ -203,6 +224,115 @@ class ChessGame:
             )
         self.promoting = True
         self._update_chessboard_position()
+
+    def _create_resign_button(self) -> ctk.CTkButton:
+        btn = ctk.CTkButton(
+            self.root,
+            fg_color=self.style.resign_fg_color,
+            bg_color='transparent',
+            text="🏁",
+            font=ctk.CTkFont("Roboto", 22, 'bold'),
+            corner_radius=15,
+            hover_color=self.style.resign_hover_color,
+            command=self._resign_game
+        )
+        return btn
+    def _resign_game(self) -> None:
+        winner = "white" if database.current_turn == "black" else "black"
+        answer = messagebox.askyesno("Resign", f"Are you sure you want to Resign? {winner.upper()} will WIN!!", icon='warning')
+
+        if answer:
+            self._show_game_over_dialog("resign", winner)
+
+    def _resign_hover(self, relx: float, relwidth: float):
+        self.resign_button.place(relx=relx, relwidth=relwidth)
+        self.resign_button.configure(fg_color=self.style.resign_hover_color, text= "Resign 🏁")
+
+    def _resign_unhover(self, relx: float, relwidth: float):
+        self.resign_button.place(relx=relx, relwidth=relwidth)
+        self.resign_button.configure(fg_color=self.style.resign_fg_color, text= "🏁")
+    
+    def _create_settings_button(self) -> ctk.CTkButton:
+        btn = ctk.CTkButton(
+            self.root,
+            fg_color=self.style.settings_fg_color,
+            bg_color='transparent',
+            text="⚙",
+            font=ctk.CTkFont("Roboto", 22, 'bold'),
+            corner_radius=15,
+            hover_color=self.style.settings_hover_color,
+            command=self._show_settings_overlay
+        )
+        return btn
+
+    def _settings_hover(self, relx: float, relwidth: float):
+        self.settings_button.place(relx=relx, relwidth=relwidth)
+        self.settings_button.configure(fg_color=self.style.settings_hover_color, text="Settings ⚙")
+
+    def _settings_unhover(self, relx: float, relwidth: float):
+        self.settings_button.place(relx=relx, relwidth=relwidth)
+        self.settings_button.configure(fg_color=self.style.settings_fg_color, text="⚙")
+    
+    def _place_settings_button(self, relx: float, rely: float, relwidth: float, relheight: float) -> None:
+        self.settings_button.unbind('<Enter>')
+        self.settings_button.unbind('<Leave>')
+
+        self.settings_button.place(relx=relx, rely=rely, relheight=relheight, relwidth=relwidth)
+
+        # Calculate base width and hover width in terms of chessboard squares
+        square_width = relwidth
+        base_relwidth = square_width * self.style.settings_width
+        hover_relwidth = square_width * self.style.settings_hover_width
+        # Offset is always hover_width - base_width
+        hover_offset = square_width * (self.style.settings_hover_width - self.style.settings_width)
+        
+        self.settings_button.bind(
+            '<Enter>', 
+            lambda event=None, rel_x=relx-hover_offset, rel_width=hover_relwidth: self._settings_hover(rel_x, rel_width)
+        )
+        self.settings_button.bind(
+            '<Leave>', 
+            lambda event=None, rel_x=relx, rel_width=base_relwidth: self._settings_unhover(rel_x, rel_width)
+        )
+
+    def _create_flip_button(self) -> ctk.CTkButton:
+        btn = ctk.CTkButton(
+            self.root,
+            fg_color=self.style.flip_fg_color,
+            bg_color='transparent',
+            text="🔄",
+            font=ctk.CTkFont("Roboto", 22, 'bold'),
+            corner_radius=15,
+            hover_color=self.style.flip_hover_color,
+            command=self._toggle_flip_board
+        )
+        return btn
+
+    def _place_flip_button(self, relx: float, rely: float, relwidth: float, relheight: float) -> None:
+
+        self.flip_button.place(relx=relx, rely=rely, relheight=relheight, relwidth=relwidth)
+    
+    def _place_resign_button(self, relx: float, rely: float, relwidth: float, relheight: float) -> None:
+        self.resign_button.unbind('<Enter>')
+        self.resign_button.unbind('<Leave>')
+
+        self.resign_button.place(relx=relx, rely=rely, relheight=relheight, relwidth=relwidth)
+
+        # Calculate base width and hover width in terms of chessboard squares
+        square_width = relwidth
+        base_relwidth = square_width * self.style.resign_width
+        hover_relwidth = square_width * self.style.resign_hover_width
+        # Offset is always hover_width - base_width
+        hover_offset = square_width * (self.style.resign_hover_width - self.style.resign_width)
+        
+        self.resign_button.bind(
+            '<Enter>', 
+            lambda event=None, rel_x=relx-hover_offset, rel_width=hover_relwidth: self._resign_hover(rel_x, rel_width)
+        )
+        self.resign_button.bind(
+            '<Leave>', 
+            lambda event=None, rel_x=relx, rel_width=base_relwidth: self._resign_unhover(rel_x, rel_width)
+        )
     
     def _update_chessboard_position(self) -> None:
         """Update chessboard frame position based on window size"""
@@ -211,16 +341,37 @@ class ChessGame:
         
         rely = self.style.chessboard_rely
         relx = utils.relative_dimensions(rely, (screen_height, screen_width))
-        
+        relwidth = 1 - relx * 2
+        relheight = 1 - rely * 2
+
         self.chessboard_frame.place(
             relx=relx,
             rely=rely,
-            relwidth=1 - relx * 2,
-            relheight=1 - rely * 2
+            relwidth=relwidth,
+            relheight=relheight
         )
+
+        # Resign button position
+        resign_relx = relx - relwidth/8
+        resign_rely = rely + (relheight/8)*3
+        
+        self._place_resign_button(resign_relx, resign_rely, relwidth/8, relheight/8)
+        
+        # Settings button position (below resign button)
+        settings_relx = resign_relx
+        settings_rely = resign_rely + relheight/8
+        
+        self._place_settings_button(settings_relx, settings_rely, relwidth/8, relheight/8)
+
+        flip_relx = relx + relwidth
+        flip_rely = rely + (relheight/8)*3
+
+        self._place_flip_button(flip_relx, flip_rely, relwidth/8, relheight/8)
+        
 
         if self.promoting:
             self._place_promotion_frame(relx, rely)
+
     
     def _place_promotion_frame(self, relx: float, rely: float) -> None:
         self.promotion_frame.place(
@@ -471,7 +622,7 @@ class ChessGame:
             fg_color=("white", "gray10"),
             corner_radius=20,
             border_width=2,
-            border_color=("gold" if result == "checkmate" else "gray"),
+            border_color=("gold" if result == "checkmate" or result == "resign" else "gray"),
             width=dialog_width,
             height=dialog_height
         )
@@ -486,6 +637,9 @@ class ChessGame:
         
         if result == "checkmate":
             title = "👑 CHECKMATE! 👑"
+            subtitle = f"{winner.capitalize()} Wins!" if winner else ""
+        elif result == "resign":
+            title = "👑 RESIGN! 👑"
             subtitle = f"{winner.capitalize()} Wins!" if winner else ""
         else:
             title = "⚔️ STALEMATE ⚔️"
@@ -580,6 +734,7 @@ class ChessGame:
         self.piece_selected = None
         self._legal_moves_update_scheduled = False
         self.flipped = False  # ADD THIS - Reset flip state
+        self.settings_open = False  # Reset settings state
         
         # Reset view matrix to standard orientation
         self.view_matrix = database.matrix  # ADD THIS
@@ -714,7 +869,8 @@ class ChessGame:
         self._clear_all_legal_move_indicators()
 
         # Flip board if needed
-        self._flip_board(database.current_turn)
+        if self.flip_allowed:
+            self._flip_board(database.current_turn)
         
         # Refresh display IMMEDIATELY
         self._clear_all_pieces()
@@ -744,12 +900,6 @@ class ChessGame:
             self.view_matrix = database.matrix
             self.flipped = False
 
-    def _flip_legal_moves(self, color) -> None:
-        """Flip legal moves"""
-        if color == "black":
-            database.black_legal_moves = utils.flip_legal(database.black_legal_moves) 
-            database.white_legal_moves = utils.flip_legal(database.white_legal_moves)
-
     def _check_game_over(self) -> None:
         """Check if game is over (checkmate or stalemate)"""
         if database.current_turn == "white":
@@ -770,6 +920,183 @@ class ChessGame:
                     self._show_game_over_dialog("checkmate", "white")
                 else:
                     self._show_game_over_dialog("stalemate")
+
+    # ==================== SETTINGS OVERLAY ====================
+
+    def _show_settings_overlay(self) -> None:
+        """Show settings overlay with configuration options"""
+        if self.settings_open:
+            return
+        
+        self.settings_open = True
+        
+        # Create semi-transparent overlay
+        overlay = ctk.CTkFrame(
+            self.root, 
+            fg_color=("gray50", "gray20"),
+            bg_color="transparent"
+        )
+        overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+
+        self.root.bind("<Escape>", lambda _: self._close_settings_overlay(overlay))
+        
+        # Calculate responsive sizing
+        screen_width = self.root.winfo_width()
+        screen_height = self.root.winfo_height()
+        
+        dialog_width = max(350, min(int(screen_width * 0.45), 550))
+        dialog_height = max(300, min(int(screen_height * 0.5), 500))
+        
+        # Responsive font sizing
+        title_font_size = max(20, min(int(screen_height * 0.04), 28))
+        button_font_size = max(12, min(int(screen_height * 0.02), 16))
+        
+        # Create dialog box
+        dialog = ctk.CTkFrame(
+            overlay,
+            fg_color=("white", "gray10"),
+            corner_radius=20,
+            border_width=2,
+            border_color=("blue", "blue"),
+            width=dialog_width,
+            height=dialog_height
+        )
+        dialog.place(relx=0.5, rely=0.5, anchor="center")
+        
+        # Title
+        title_font_size = max(20, min(int(screen_height * 0.04), 28))
+        title_label = ctk.CTkLabel(
+            dialog, 
+            text="⚙ Settings", 
+            font=("Arial Bold", title_font_size)
+        )
+        title_label.place(relx=0.5, rely=0.05, anchor="n", relwidth=0.9)
+        
+        # Main content frame
+        content_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        content_frame.place(relx=0.05, rely=0.15, relwidth=0.9, relheight=0.65)
+        
+        # Flip Board toggle
+        def flip_allowed_controller() -> None:
+            self._toggle_flip_allowed()
+            flip_toggle.select() if self.flip_allowed else flip_toggle.deselect()
+
+        flip_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        flip_frame.place(relx=0.05, rely=0.15, relwidth=0.9, relheight=0.12)
+        
+        flip_label = ctk.CTkLabel(
+            flip_frame, 
+            text="Flip Board",
+            font=("Arial", 14),
+            wraplength=dialog_width-100
+        )
+        flip_label.place(relx=0, rely=0.5, anchor="w", relwidth=0.6)
+        
+        flip_toggle = ctk.CTkSwitch(
+            flip_frame,
+            text="",
+            command=flip_allowed_controller
+        )
+        flip_toggle.place(relx=0.95, rely=0.5, anchor="e")
+        flip_toggle.select() if self.flip_allowed else flip_toggle.deselect()
+        
+        # Board Colors section title
+        colors_label = ctk.CTkLabel(
+            dialog, 
+            text="Board Colors",
+            font=("Arial", 14, "bold")
+        )
+        colors_label.place(relx=0.05, rely=0.3, relwidth=0.9, relheight=0.08)
+        
+        # White squares color
+        white_label = ctk.CTkLabel(dialog, text="Light Squares:", font=("Arial", 12))
+        white_label.place(relx=0.05, rely=0.4, relwidth=0.5, relheight=0.08)
+        
+        white_color_combo = ctk.CTkComboBox(
+            dialog,
+            values=["white", "beige", "ivory", "lightgray", "snow", "wheat"],
+            state="readonly",
+            width=120
+        )
+        white_color_combo.set(self.style.white_box_color)
+        white_color_combo.place(relx=0.55, rely=0.4, relwidth=0.4, relheight=0.08)
+        white_color_combo.configure(command=lambda choice: self._change_white_color(choice))
+        
+        # Black squares color
+        black_label = ctk.CTkLabel(dialog, text="Dark Squares:", font=("Arial", 12))
+        black_label.place(relx=0.05, rely=0.52, relwidth=0.5, relheight=0.08)
+        
+        black_color_combo = ctk.CTkComboBox(
+            dialog,
+            values=["brown", "darkbrown", "darkgray", "saddlebrown", "black", "sienna"],
+            state="readonly",
+            width=120
+        )
+        black_color_combo.set(self.style.black_box_color)
+        black_color_combo.place(relx=0.55, rely=0.52, relwidth=0.4, relheight=0.08)
+        black_color_combo.configure(command=lambda choice: self._change_black_color(choice))
+        
+        # Back button
+        back_btn = ctk.CTkButton(
+            dialog,
+            text="Back",
+            font=("Arial", button_font_size),
+            width=120,
+            height=40,
+            fg_color="transparent",
+            border_width=2,
+            command=lambda: self._close_settings_overlay(overlay)
+        )
+        back_btn.place(relx=0.5, rely=0.8, anchor="center", relwidth=0.4, relheight=0.12)
+
+    def _toggle_flip_board(self) -> None:
+        """Toggle board flip from settings"""
+        self._flip_board("black" if not self.flipped else "white")
+        self._clear_all_pieces()
+        self._render_all_pieces()
+
+    def _toggle_flip_allowed(self) -> None:
+        self.flip_allowed = not self.flip_allowed
+
+        if not self.flip_allowed:
+            self._flip_board("white")
+            self._clear_all_pieces()
+            self._render_all_pieces()
+
+        else:
+            self._flip_board(database.current_turn)
+            self._clear_all_pieces()
+            self._render_all_pieces()
+
+    def _change_white_color(self, color: str) -> None:
+        """Change white square color"""
+        self.style.white_box_color = color
+        self._refresh_board_colors()
+
+    def _change_black_color(self, color: str) -> None:
+        """Change black square color"""
+        self.style.black_box_color = color
+        self._refresh_board_colors()
+
+    def _refresh_board_colors(self) -> None:
+        """Refresh board colors after change"""
+        color1 = self.style.white_box_color
+        color2 = self.style.black_box_color
+        
+        for row in range(8):
+            for col in range(8):
+                self.chessboard_squares[(row, col)].configure(fg_color=color1, bg_color=color1)
+                # Alternate colors
+                color1, color2 = color2, color1
+            # Alternate at end of row
+            color1, color2 = color2, color1
+
+    def _close_settings_overlay(self, overlay: ctk.CTkFrame) -> None:
+        """Close settings overlay"""
+        overlay.destroy()
+        self.settings_open = False
+
+        self.root.bind("<Escape>", lambda _: self._handle_escape())
 
     
     def _handle_square_click(self, visual_square: Tuple[int, int]) -> None:

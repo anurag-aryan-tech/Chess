@@ -521,11 +521,17 @@ class LegalMovesEngine:
         
         opponent_color = "white" if color == "black" else "black"
         row = 0 if color == "black" else 7
+        king_col = 4
         
+        # Check if king is in check (use fresh calculation)
+        if self._is_square_attacked_by_any_piece((row, king_col), opponent_color, matrix):
+            return False
+        
+        # Check if path is clear and safe (use fresh calculation)
         for col in castle_range:
             if self.is_occupied(matrix[row, col]):
                 return False
-            if self.opponent_legal_search(opponent_color, (row, col), matrix):
+            if self._is_square_attacked_by_any_piece((row, col), opponent_color, matrix):
                 return False
         
         return True

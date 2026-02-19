@@ -496,6 +496,45 @@ Contributions make the open-source community an amazing place to learn and creat
 
 ---
 
+## 🤝 Contributing
+
+Contributions are welcome and greatly appreciated! 🎉  
+Whether you’re fixing a bug, improving the UI, enhancing the AI, or adding new features — your help makes this project better.
+
+### 🟢 Getting Started
+- Check out issues labeled **`good first issue`** for beginner-friendly tasks
+- More complex tasks are marked **`help wanted`**
+- Feel free to comment on an issue before starting — discussion is encouraged
+
+### 🚀 How to Contribute
+1. 🍴 Fork the repository
+2. 🌿 Create a new branch (`feature/your-feature-name`)
+3. ✍️ Make your changes and test thoroughly
+4. 📤 Commit your changes with a clear message
+5. 🔃 Open a Pull Request
+
+### 📋 Contribution Guidelines
+- Follow existing code style and architecture
+- Keep PRs focused and easy to review
+- Test changes in **VS AI** and **Pass & Play** modes
+- Update documentation if you add or change features
+
+### 🧩 Areas Where Help Is Needed
+- 🍎 macOS and 🐧 Linux Stockfish integration
+- 📜 Move history panel and notation improvements
+- 🎨 UI/UX enhancements
+- 📊 Analysis and evaluation features
+- 🧪 Bug fixes and performance improvements
+
+📖 Please read **[CONTRIBUTING.md](CONTRIBUTING.md)** for detailed guidelines before opening a Pull Request.
+
+---
+
+💬 **Have an idea or question?**  
+Open an issue or start a discussion — all feedback is welcome!
+
+---
+
 ## 🐛 Known Issues
 
 - Stockfish binary is Windows-only in v1.2 (macOS/Linux support coming in v1.3)

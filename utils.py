@@ -21,7 +21,6 @@ warnings.filterwarnings("ignore", category=UserWarning, module="stockfish")
 # Piece type mapping for FEN generation
 PIECE_TO_FEN = {
     "p": "P", "r": "R", "n": "N", "b": "B", "q": "Q", "k": "K",
-    "-p": "p", "-r": "r", "-n": "n", "-b": "b", "-q": "q", "-k": "k",
 }
 
 # Direction vectors for piece movement
@@ -123,6 +122,8 @@ class NotationGenerator:
                     piece_str = str(cell)
                     piece_type = piece_str.lstrip('-')[0].lower()
                     fen_piece = PIECE_TO_FEN.get(piece_type, "")
+                    if "-" in piece_str and fen_piece:
+                        fen_piece = fen_piece.lower()
                     if fen_piece:
                         fen_row += fen_piece
             

@@ -7,6 +7,7 @@ from typing import Tuple, Dict, Optional, Literal, Any
 from dataclasses import dataclass
 from utils import Utilities
 from database.database import database, MoveResult
+from review_system import ReviewSystem
 
 @dataclass
 class STYLE_CONFIG:
@@ -62,6 +63,7 @@ class ChessGame:
         
         # Services
         self.utils = Utilities()
+        self.review = ReviewSystem()
         
         # Window resize tracking
         self.prev_width = 0
@@ -187,6 +189,7 @@ class ChessGame:
         answer = messagebox.askyesno("Warning", "Are you sure you want to close the game?")
         if answer:
             try:
+                self.review.shutdown()
                 self.root.quit()
                 self.root.destroy()
             except Exception as e:
@@ -940,8 +943,9 @@ class ChessGame:
         is_black = to_square[0] == 7  # Black pawns promote on rank 7 (row 7 in matrix)
         promoted_piece = self._get_promoted_piece(base, is_black)
         
-        # Check if there's a captured piece at destination
-        is_capture = database.matrix[to_square[0], to_square[1]] != 0
+        # Capture target must be read before writing promoted piece
+        captured_piece = database.matrix[to_square[0], to_square[1]]
+        is_capture = captured_piece != 0
         
         # Place the promoted piece on the board
         self.matrix[to_square[0], to_square[1]] = promoted_piece
@@ -953,11 +957,10 @@ class ChessGame:
         
         # Remove captured piece if it exists
         if is_capture:
-            captured = database.matrix[to_square[0], to_square[1]]
             if is_black:
-                database.white_pieces = database.white_pieces[database.white_pieces != captured]
+                database.white_pieces = database.white_pieces[database.white_pieces != captured_piece]
             else:
-                database.black_pieces = database.black_pieces[database.black_pieces != captured]
+                database.black_pieces = database.black_pieces[database.black_pieces != captured_piece]
         
         # Add promoted piece to piece list
         if is_black:
@@ -986,6 +989,7 @@ class ChessGame:
         # Store in game history
         database.game_history.append(stockfish_notation)
         database.game_pgn.append(chess_notation)
+        self.review.evaluate_last_move_async()
         
         database.gamelogger.move(f"Move: {chess_notation}")
         
@@ -1263,6 +1267,12 @@ class ChessGame:
         
         if not self._is_legal_move(piece, to_square):
             return
+
+        legal_mvs = database.get_legal_moves(database.current_turn)
+        if len(legal_mvs) == 1 and len(legal_mvs.get(piece, [])) == 1:
+            database.last_forced = True
+        else:
+            database.last_forced = False
         
         # Check if this is a pawn promotion that requires user input
         if "p" in piece and to_square[0] in [0, 7]:
@@ -1371,6 +1381,7 @@ class ChessGame:
             # Store in game history
             database.game_history.append(stockfish_notation)
             database.game_pgn.append(chess_notation)
+            self.review.evaluate_last_move_async()
             
             database.gamelogger.move(f"Move: {chess_notation}")
             

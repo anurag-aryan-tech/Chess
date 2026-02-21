@@ -493,6 +493,10 @@ class Database:
         self.game_pgn: List[str] = []
         self.last_synced_fen: Optional[str] = None
 
+        # Evaluation
+        self.evaluation_history: List[Dict[str, int|str|float]] = []
+        self.last_forced: bool = False
+
         self.ai_total_moves: int = 0
         self.ai_blunder_moves: int = 0
         
@@ -587,6 +591,13 @@ class Database:
         
         # Reset board
         self.matrix = np.zeros((8, 8), dtype=object)
+
+        # Reset Game History
+        self.game_history = []
+        self.game_pgn = []
+
+        # Reset evaluation history
+        self.evaluation_history: List[Dict[str, int|str|float]] = []
         
         # Clear caches
         self.white_legal_moves.clear()

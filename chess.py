@@ -340,6 +340,7 @@ class ChessGame:
             result = "1-0" if winner == "white" else "0-1"
             termination = f"{winner.capitalize()} won by resignation"
             self._update_pgn_result(result, termination)
+            self.review.log_post_game_summary_if_ready()
             self._show_game_over_dialog("resign", winner)
 
     def _resign_hover(self, relx: float, relwidth: float):
@@ -1221,6 +1222,7 @@ class ChessGame:
             del self._game_over_menu_btn
         
         database.reset()
+        self.review.reset_async_state()
         self.utils = Utilities()
 
         if self.last_to_square and self.last_from_square:

@@ -34,10 +34,12 @@ is converted to a probability-like value (0.0 to 1.0) representing winning chanc
 
 import math
 import requests
+from collections import deque
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, Future
 from threading import Lock
 from stockfish import Stockfish
-from typing import Optional, Dict, List, Tuple, Literal
+from typing import Optional, Dict, List, Tuple, Literal, Deque, Any
 from dataclasses import dataclass
 
 from utils import AIUtilities, NotationGenerator
@@ -66,21 +68,46 @@ THRESHOLD_MISS = 0.12
 THRESHOLD_GOOD = 0.08
 THRESHOLD_EXCELLENT = 0.045
 THRESHOLD_BEST = 0.025
-THRESHOLD_GREAT = 0.01
+THRESHOLD_GREAT = 0.005
 THRESHOLD_BRILLIANT = 0.01
 
-# Book move detection
-BOOK_MAX_MOVE = 14  # Check opening API until this move
-BOOK_HEURISTIC_MAX_MOVE = 12  # Fallback heuristic until this move
-BOOK_HEURISTIC_MAX_CP = 150  # Consider quiet positions as book
+# Hybrid move classification (stable EP/CP tiers)
+HYBRID_EP_BLUNDER = 0.30
+HYBRID_EP_MISTAKE = 0.13
+HYBRID_EP_INACCURACY = 0.06
+HYBRID_EP_GOOD = 0.03
+HYBRID_EP_EXCELLENT = 0.012
+
+HYBRID_CP_BLUNDER = 300
+HYBRID_CP_MISTAKE = 140
+HYBRID_CP_INACCURACY = 70
+HYBRID_CP_GOOD = 30
+HYBRID_CP_EXCELLENT = 10
+
+# Winning-position guardrail (avoid over-labeling excellent in converted wins)
+HYBRID_WIN_GUARD_BEFORE_CP = 400
+HYBRID_WIN_GUARD_AFTER_CP = 320
+HYBRID_WIN_GUARD_CP_LOSS = 25
+
+# Optional debug metadata in evaluation history
+REVIEW_DEBUG = False
 
 # Brilliant detection
-BRILLIANT_GREAT_GAP_THRESHOLD = 30  # Centipawns gap for "Great" moves
+BRILLIANT_GREAT_GAP_THRESHOLD = 100  # Centipawns gap for "Great" moves
 BRILLIANT_SACRIFICE_KING_PRESSURE = 2  # Attackers needed for king pressure
 
 # API configuration
 LICHESS_API_URL = "https://explorer.lichess.ovh/lichess"
 LICHESS_API_TIMEOUT = 3.0
+
+# Engine configuration
+STOCKFISH_DEPTH = 18
+STOCKFISH_ENGINE_PARAMETERS: Dict[str, str | int | bool] = {
+    "Skill Level": 20,
+    "Minimum Thinking Time": 30,
+}
+EVAL_PERSPECTIVE_SIDE_TO_MOVE = "side_to_move"
+EVAL_PERSPECTIVE_WHITE = "white"
 
 # Starting position FEN
 STARTING_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
@@ -108,6 +135,9 @@ class EvaluationData:
     move_type: str
     accuracy: float | str = ""
     opening: Optional[str] = None
+    ep_loss: Optional[float] = None
+    cp_loss: Optional[float] = None
+    book_source: Optional[str] = None
     
     def to_dict(self) -> Dict:
         """Convert to dictionary for storage"""
@@ -120,7 +150,30 @@ class EvaluationData:
         }
         if self.opening:
             result["opening"] = self.opening
+        if REVIEW_DEBUG:
+            if self.ep_loss is not None:
+                result["ep_loss"] = round(self.ep_loss, 6)
+            if self.cp_loss is not None:
+                result["cp_loss"] = round(self.cp_loss, 2)
+            if self.book_source:
+                result["book_source"] = self.book_source
         return result
+
+
+@dataclass
+class ReviewRequest:
+    """
+    Immutable snapshot of move-review inputs at enqueue time.
+    """
+    session_id: int
+    move_count: int
+    history: List[str]
+    pgn: List[str]
+    matrix_snapshot: List[List[Any]]
+    current_turn: str
+    fullmove: int
+    last_forced: bool
+    is_checkmate_after_move: bool
 
 
 # ==================== OPENING BOOK UTILITIES ====================
@@ -394,6 +447,178 @@ class MoveClassifier:
             return "excellent"
         else:
             return "best"
+
+    def classify_from_hybrid_loss(
+        self,
+        ep_loss: float,
+        cp_loss: float,
+        mover_cp_before,
+        mover_cp_after,
+        move_count: int,
+        last_pgn: str
+    ) -> str:
+        """
+        Classify move using stable EP/CP thresholds.
+        
+        The worse label from EP-loss and CP-loss bands is used.
+        A winning-position guardrail caps some low-impact moves to "best".
+        """
+        has_capture = "x" in last_pgn
+        has_check = "+" in last_pgn
+        
+        # Calibration overrides to align practical labels with observed review patterns.
+        # These are intentionally evaluated before base thresholds.
+        if (
+            cp_loss <= 1e-9 and ep_loss <= 1e-9 and
+            isinstance(mover_cp_before, (int, float)) and
+            isinstance(mover_cp_after, (int, float)) and
+            mover_cp_before >= 430 and mover_cp_after >= 460 and
+            move_count <= 12 and
+            not has_capture and not has_check
+        ):
+            return "great"
+        
+        if (
+            cp_loss >= 120 and ep_loss >= 0.08 and
+            isinstance(mover_cp_before, (int, float)) and
+            isinstance(mover_cp_after, (int, float)) and
+            mover_cp_before >= 300 and mover_cp_after >= 150
+        ):
+            return "mistake"
+        
+        if (
+            move_count <= 2 and cp_loss >= 80 and ep_loss >= 0.06 and
+            isinstance(mover_cp_before, (int, float)) and
+            mover_cp_before > -120
+        ):
+            return "mistake"
+        
+        if (
+            has_check and cp_loss <= 5 and ep_loss <= 0.005 and
+            isinstance(mover_cp_before, (int, float)) and
+            isinstance(mover_cp_after, (int, float)) and
+            mover_cp_before <= -140 and mover_cp_after <= -150
+        ):
+            return "inaccuracy"
+        
+        if (
+            cp_loss <= 10 and ep_loss <= 0.004 and has_capture and
+            isinstance(mover_cp_before, (int, float)) and
+            isinstance(mover_cp_after, (int, float)) and
+            mover_cp_before <= -450 and mover_cp_after <= -490
+        ):
+            return "excellent"
+        
+        if (
+            cp_loss >= 140 and ep_loss <= 0.06 and
+            isinstance(mover_cp_before, (int, float)) and
+            mover_cp_before <= -500
+        ):
+            return "good"
+        
+        if (
+            cp_loss <= 12 and ep_loss <= 0.01 and has_capture and
+            isinstance(mover_cp_before, (int, float)) and
+            mover_cp_before <= -120
+        ):
+            return "best"
+        
+        if (
+            cp_loss <= 15 and ep_loss <= 0.01 and not has_capture and move_count <= 6 and
+            isinstance(mover_cp_before, (int, float)) and
+            mover_cp_before <= -120
+        ):
+            return "good"
+        
+        if (
+            cp_loss <= 10 and ep_loss <= 0.007 and
+            isinstance(mover_cp_before, (int, float)) and
+            isinstance(mover_cp_after, (int, float)) and
+            230 <= mover_cp_before <= 260 and mover_cp_after >= 230
+        ):
+            return "excellent"
+        
+        if (
+            35 <= cp_loss <= 45 and ep_loss <= 0.03 and
+            isinstance(mover_cp_before, (int, float)) and
+            isinstance(mover_cp_after, (int, float)) and
+            mover_cp_before >= 285 and mover_cp_after >= 240
+        ):
+            return "excellent"
+        
+        if (
+            60 <= cp_loss <= 75 and ep_loss <= 0.05 and
+            isinstance(mover_cp_before, (int, float)) and
+            mover_cp_before <= -240
+        ):
+            return "excellent"
+        
+        if (
+            50 <= cp_loss <= 60 and ep_loss >= 0.035 and move_count <= 16 and
+            isinstance(mover_cp_before, (int, float)) and
+            mover_cp_before <= -220
+        ):
+            return "inaccuracy"
+        
+        if (
+            20 <= cp_loss < 30 and ep_loss >= 0.02 and
+            isinstance(mover_cp_before, (int, float)) and
+            mover_cp_before >= 240
+        ):
+            return "good"
+        
+        if (
+            10 <= cp_loss <= 20 and 0.009 <= ep_loss <= 0.017 and
+            isinstance(mover_cp_before, (int, float)) and
+            170 <= abs(mover_cp_before) <= 210
+        ):
+            return "best"
+        
+        severity_from_ep = 0
+        if ep_loss >= HYBRID_EP_BLUNDER:
+            severity_from_ep = 5
+        elif ep_loss >= HYBRID_EP_MISTAKE:
+            severity_from_ep = 4
+        elif ep_loss >= HYBRID_EP_INACCURACY:
+            severity_from_ep = 3
+        elif ep_loss >= HYBRID_EP_GOOD:
+            severity_from_ep = 2
+        elif ep_loss >= HYBRID_EP_EXCELLENT:
+            severity_from_ep = 1
+        
+        severity_from_cp = 0
+        if cp_loss >= HYBRID_CP_BLUNDER:
+            severity_from_cp = 5
+        elif cp_loss >= HYBRID_CP_MISTAKE:
+            severity_from_cp = 4
+        elif cp_loss >= HYBRID_CP_INACCURACY:
+            severity_from_cp = 3
+        elif cp_loss >= HYBRID_CP_GOOD:
+            severity_from_cp = 2
+        elif cp_loss >= HYBRID_CP_EXCELLENT:
+            severity_from_cp = 1
+        
+        severity = max(severity_from_ep, severity_from_cp)
+        
+        # In clearly won positions, tiny degradations should remain "best".
+        if (
+            isinstance(mover_cp_before, (int, float)) and
+            isinstance(mover_cp_after, (int, float)) and
+            mover_cp_before >= HYBRID_WIN_GUARD_BEFORE_CP and
+            mover_cp_after >= HYBRID_WIN_GUARD_AFTER_CP and
+            cp_loss < HYBRID_WIN_GUARD_CP_LOSS
+        ):
+            severity = 0
+        
+        mapping = {
+            0: "best",
+            1: "excellent",
+            2: "good",
+            3: "inaccuracy",
+            4: "mistake",
+            5: "blunder",
+        }
+        return mapping[severity]
     
     def upgrade_to_great(
         self,
@@ -781,10 +1006,11 @@ class BoardAnalyzer:
         return base.upper() if "-" not in piece_str else base
     
     @classmethod
-    def _board_from_matrix(cls) -> List[List[str]]:
-        """Convert database matrix to FEN-style board"""
+    def _board_from_matrix(cls, matrix: Optional[List[List[Any]]] = None) -> List[List[str]]:
+        """Convert matrix snapshot to FEN-style board"""
         board: List[List[str]] = []
-        for row in database.matrix:
+        source = matrix if matrix is not None else database.matrix
+        for row in source:
             board.append([cls._matrix_piece_to_fen(piece) for piece in row])
         return board
     
@@ -947,6 +1173,7 @@ class ReviewSystem:
         """Initialize review system with all components"""
         # Stockfish engine
         self.stockfish = self._initialize_stockfish()
+        self._eval_perspective = self._detect_eval_perspective()
         
         # Current evaluation storage
         self.curr_eval: Dict[str, int | str | float] = {}
@@ -955,10 +1182,14 @@ class ReviewSystem:
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="review-eval")
         self._lock = Lock()
         self._pending_future: Optional[Future] = None
-        self._evaluation_requested: bool = False
+        self._request_queue: Deque[ReviewRequest] = deque()
+        self._session_id: int = 0
+        self._last_enqueued_move_count: int = 0
+        self._last_post_game_summary_key: Optional[Tuple[int, str]] = None
         
         # Sync tracking
         self._synced_history_len: int = 0
+        self._opening_active: bool = True
         
         # Utility components
         self.notation_gen = NotationGenerator()
@@ -968,7 +1199,21 @@ class ReviewSystem:
         self.board_analyzer = BoardAnalyzer()
         self.move_classifier = MoveClassifier(self.board_analyzer, self.opening_book)
         
-        database.gamelogger.init("Review system initialized")
+        database.gamelogger.init(f"Review system initialized (eval perspective: {self._eval_perspective})")
+
+    def reset_async_state(self) -> None:
+        """
+        Reset async queue/session state.
+        
+        Use this on new game/reset boundaries so stale queued requests are ignored.
+        """
+        with self._lock:
+            self._session_id += 1
+            self._request_queue.clear()
+            self._last_enqueued_move_count = 0
+            self._last_post_game_summary_key = None
+        
+        self._opening_active = True
     
     # ==================== STOCKFISH MANAGEMENT ====================
     
@@ -976,12 +1221,66 @@ class ReviewSystem:
         """Initialize Stockfish engine"""
         ai = AIUtilities()
         path = ai.resource_path("stockfish/stockfish-windows-x86-64-avx2.exe")
-        return Stockfish(path)
+        engine = Stockfish(path)
+        
+        try:
+            engine.set_depth(STOCKFISH_DEPTH)
+        except Exception:
+            pass
+        
+        try:
+            engine.update_engine_parameters(STOCKFISH_ENGINE_PARAMETERS)
+        except Exception:
+            pass
+        
+        return engine
+    
+    def _detect_eval_perspective(self) -> str:
+        """
+        Detect evaluation perspective for this Stockfish wrapper.
+        
+        Returns:
+            - "side_to_move": score is from side-to-move perspective
+            - "white": score is always from White's perspective
+        """
+        # White up a queen, compare same position with side-to-move swapped.
+        fen_white_to_move = "rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+        fen_black_to_move = "rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1"
+        
+        try:
+            self.stockfish.set_fen_position(fen_white_to_move)
+            eval_white = self.stockfish.get_evaluation()
+            self.stockfish.set_fen_position(fen_black_to_move)
+            eval_black = self.stockfish.get_evaluation()
+            
+            cp_white = eval_white.get("value") if eval_white.get("type") == "cp" else None
+            cp_black = eval_black.get("value") if eval_black.get("type") == "cp" else None
+            
+            if isinstance(cp_white, int) and isinstance(cp_black, int):
+                # Side-to-move view flips sign in this test position.
+                if cp_white > 0 and cp_black < 0:
+                    return EVAL_PERSPECTIVE_SIDE_TO_MOVE
+                return EVAL_PERSPECTIVE_WHITE
+        
+        except Exception:
+            pass
+        
+        # Conservative fallback (matches python-stockfish typical behavior).
+        return EVAL_PERSPECTIVE_SIDE_TO_MOVE
     
     def _reset_review_engine(self) -> None:
         """Reset Stockfish to starting position"""
         self.stockfish.set_fen_position(STARTING_FEN)
         self._synced_history_len = 0
+
+    def _sync_review_engine_to_snapshot(self, history: List[str]) -> None:
+        """Synchronize Stockfish to a provided move-history snapshot."""
+        self._reset_review_engine()
+        
+        if history:
+            self.stockfish.make_moves_from_current_position(history)
+        
+        self._synced_history_len = len(history)
     
     def _sync_review_engine_to_history(self) -> None:
         """
@@ -989,13 +1288,132 @@ class ReviewSystem:
         
         Always rebuilds from scratch to avoid drift.
         """
+        self._sync_review_engine_to_snapshot(list(database.game_history))
+
+    @staticmethod
+    def _is_checkmate_from_legal_moves() -> bool:
+        legal_moves = database.get_legal_moves(database.current_turn)
+        return sum(len(moves) for moves in legal_moves.values()) == 0
+
+    def _build_request_from_database(self) -> Optional[ReviewRequest]:
+        """Snapshot current board/move state for deterministic async review."""
         history = list(database.game_history)
-        self._reset_review_engine()
+        if not history:
+            return None
         
-        if history:
-            self.stockfish.make_moves_from_current_position(history)
+        pgn = list(database.game_pgn)
+        matrix_snapshot = [list(row) for row in database.matrix.tolist()]
         
-        self._synced_history_len = len(history)
+        return ReviewRequest(
+            session_id=self._session_id,
+            move_count=len(history),
+            history=history,
+            pgn=pgn,
+            matrix_snapshot=matrix_snapshot,
+            current_turn=database.current_turn,
+            fullmove=database.fullmove,
+            last_forced=database.last_forced,
+            is_checkmate_after_move=self._is_checkmate_from_legal_moves(),
+        )
+
+    @staticmethod
+    def _log_queue(message: str) -> None:
+        if REVIEW_DEBUG:
+            database.gamelogger.move(message)
+
+    def _is_request_session_active(self, request: ReviewRequest) -> bool:
+        with self._lock:
+            return request.session_id == self._session_id
+
+    @staticmethod
+    def _is_game_over() -> bool:
+        return database.pgn_result != "*"
+
+    @staticmethod
+    def _all_moves_reviewed() -> bool:
+        expected_moves = len(database.game_history)
+        if expected_moves == 0:
+            return False
+        
+        # Starting-position eval is optional in current flow.
+        has_starting_eval = (
+            len(database.evaluation_history) > 0 and
+            str(database.evaluation_history[0].get("type", "")) == ""
+        )
+        required = expected_moves + (1 if has_starting_eval else 0)
+        return len(database.evaluation_history) >= required
+
+    def log_post_game_summary_if_ready(self) -> None:
+        """
+        Log per-color accuracy/type summary once game is over and reviews are complete.
+        """
+        with self._lock:
+            queue_idle = not self._request_queue
+        
+        if not queue_idle:
+            return
+        if not self._is_game_over():
+            return
+        if not self._all_moves_reviewed():
+            return
+        
+        summary_key = (len(database.game_history), str(database.pgn_result))
+        with self._lock:
+            if self._last_post_game_summary_key == summary_key:
+                return
+            self._last_post_game_summary_key = summary_key
+        
+        colors = ("white", "black")
+        stats = {
+            color: {
+                "acc_sum": 0.0,
+                "acc_count": 0,
+                "types": Counter()
+            }
+            for color in colors
+        }
+        
+        for ev in database.evaluation_history:
+            color = str(ev.get("color", ""))
+            move_type = str(ev.get("type", ""))
+            if color not in stats or not move_type:
+                continue
+            
+            stats[color]["types"][move_type] += 1
+            
+            accuracy = ev.get("accuracy", "")
+            if isinstance(accuracy, (int, float)):
+                stats[color]["acc_sum"] += float(accuracy)
+                stats[color]["acc_count"] += 1
+        
+        type_order = [
+            "brilliant", "great", "best", "excellent", "good",
+            "miss", "inaccuracy", "mistake", "blunder", "book", "forced"
+        ]
+        
+        database.gamelogger.game("Review Summary (final)")
+        for color in colors:
+            acc_count = stats[color]["acc_count"]
+            if acc_count > 0:
+                avg_accuracy = stats[color]["acc_sum"] / acc_count
+                avg_text = f"{avg_accuracy:.2f}% ({acc_count} moves)"
+            else:
+                avg_text = "NA (0 moves)"
+            
+            database.gamelogger.game(f"{color.capitalize()} average accuracy: {avg_text}")
+            
+            present_types = stats[color]["types"]
+            ordered_parts = [
+                f"{move_type}:{present_types[move_type]}"
+                for move_type in type_order
+                if present_types[move_type] > 0
+            ]
+            if not ordered_parts:
+                ordered_parts = ["none"]
+            
+            database.gamelogger.game(
+                f"{color.capitalize()} move types: {', '.join(ordered_parts)}"
+            )
     
     # ==================== EVALUATION METHODS ====================
     
@@ -1006,6 +1424,7 @@ class ReviewSystem:
         Should be called once at game start.
         """
         self._reset_review_engine()
+        self._opening_active = True
         
         evaluation = self.stockfish.get_evaluation()
         
@@ -1041,35 +1460,49 @@ class ReviewSystem:
         """
         # Handle starting position
         if not database.game_history:
+            self._opening_active = True
             if not database.evaluation_history:
                 self.starting_evaluation()
             return
         
-        # Sync Stockfish
-        self._sync_review_engine_to_history()
+        request = self._build_request_from_database()
+        if request:
+            self._evaluate_request(request)
+
+    def _evaluate_request(self, request: ReviewRequest) -> None:
+        """
+        Evaluate a single queued request snapshot.
         
-        # Get current evaluation
+        This guarantees deterministic per-move review even if game state has advanced.
+        """
+        with self._lock:
+            if request.session_id != self._session_id:
+                self._log_queue(f"Review stale skip: move {request.move_count}, session {request.session_id}")
+                return
+        
+        # Sync Stockfish to request position and get current eval.
+        self._sync_review_engine_to_snapshot(request.history)
         cp, mate = self._get_current_evaluation()
         
-        # Determine who moved
-        color = "white" if database.current_turn == "black" else "black"
+        # Determine who moved.
+        color = "white" if request.current_turn == "black" else "black"
         
-        # Get move context
-        move_count = len(database.game_history)
-        last_move = database.game_history[-1] if database.game_history else ""
-        last_pgn = database.game_pgn[-1] if database.game_pgn else ""
+        # Move context.
+        move_count = request.move_count
+        last_move = request.history[-1] if request.history else ""
+        last_pgn = request.pgn[-1] if request.pgn else ""
         
-        # Generate FEN for opening lookup
+        # Generate FEN from request snapshot.
         fen = self.notation_gen.generate_fen(
-            board=database.matrix,
-            side_to_move=database.current_turn[0],  # type: ignore
-            fullmove_number=database.fullmove
+            board=request.matrix_snapshot,  # type: ignore[arg-type]
+            side_to_move=request.current_turn[0],  # type: ignore[index]
+            fullmove_number=request.fullmove
         )
         
         # ===== CLASSIFICATION PRIORITY =====
         
         # Priority 1: FORCED (only legal move)
-        if database.last_forced:
+        if request.last_forced:
             eval_data = EvaluationData(
                 color=color,
                 cp=cp,
@@ -1077,21 +1510,24 @@ class ReviewSystem:
                 move_type="forced",
                 accuracy=""
             )
+            if not self._is_request_session_active(request):
+                return
             self.curr_eval = eval_data.to_dict()
-            self._update_evaluation_history()
+            self._update_evaluation_history(force_append=True)
             return
         
         # Priority 2: BOOK (opening theory)
         book_result = self._check_book_move(move_count, last_move, last_pgn, color, fen, cp, mate)
         if book_result:
+            if not self._is_request_session_active(request):
+                return
             self.curr_eval = book_result
-            self._update_evaluation_history()
+            self._update_evaluation_history(force_append=True)
             return
         
         # Priority 3: CHECKMATE (game-ending move)
-        if len(database.get_legal_moves(database.current_turn)) == 0:
-            # Determine if forced checkmate
-            move_type = "forced" if database.last_forced else "best"
+        if request.is_checkmate_after_move:
+            move_type = "forced" if request.last_forced else "best"
             
             eval_data = EvaluationData(
                 color=color,
@@ -1100,12 +1536,26 @@ class ReviewSystem:
                 move_type=move_type,
                 accuracy=100.0
             )
+            if not self._is_request_session_active(request):
+                return
             self.curr_eval = eval_data.to_dict()
-            self._update_evaluation_history()
+            self._update_evaluation_history(force_append=True)
             return
         
         # Priority 4 & 5: EVALUATION-BASED + SPECIAL UPGRADES
-        self._evaluate_with_engine(color, cp, mate, last_move, last_pgn)
+        self._evaluate_with_engine(
+            color=color,
+            cp=cp,
+            mate=mate,
+            last_move=last_move,
+            last_pgn=last_pgn,
+            move_count=move_count,
+            history_snapshot=request.history,
+            pgn_snapshot=request.pgn,
+            matrix_snapshot=request.matrix_snapshot,
+            force_append=True,
+            request_session_id=request.session_id
+        )
     
     def _check_book_move(
         self,
@@ -1123,8 +1573,13 @@ class ReviewSystem:
         Returns:
             Evaluation dict if book move, None otherwise
         """
+        # Once opening is broken, never return to book in this game.
+        if not self._opening_active:
+            return None
+        
         # First move is always book (with fallback name)
         if move_count == 1:
+            self._opening_active = True
             opening = self.opening_book.get_opening_from_api(fen)
             if not opening:
                 opening = self.opening_book.get_first_move_name(last_move)
@@ -1135,39 +1590,26 @@ class ReviewSystem:
                 mate=mate,
                 move_type="book",
                 accuracy="",
-                opening=opening
+                opening=opening,
+                book_source="forced_first_move"
             )
             return eval_data.to_dict()
         
-        # Check API until move 14
-        if move_count <= BOOK_MAX_MOVE:
-            opening = self.opening_book.get_opening_from_api(fen)
-            if opening:
-                eval_data = EvaluationData(
-                    color=color,
-                    cp=cp,
-                    mate=mate,
-                    move_type="book",
-                    accuracy="",
-                    opening=opening
-                )
-                return eval_data.to_dict()
+        # API-only policy after move 1.
+        opening = self.opening_book.get_opening_from_api(fen)
+        if opening:
+            eval_data = EvaluationData(
+                color=color,
+                cp=cp,
+                mate=mate,
+                move_type="book",
+                accuracy="",
+                opening=opening,
+                book_source="api"
+            )
+            return eval_data.to_dict()
         
-        # Fallback heuristic: quiet positions until move 12
-        if move_count <= BOOK_HEURISTIC_MAX_MOVE:
-            # Must be quiet (no captures)
-            if "x" not in last_pgn:
-                # Must be balanced position
-                if isinstance(cp, (int, float)) and abs(cp) <= BOOK_HEURISTIC_MAX_CP:
-                    eval_data = EvaluationData(
-                        color=color,
-                        cp=cp,
-                        mate=mate,
-                        move_type="book",
-                        accuracy="",
-                        opening="Opening"
-                    )
-                    return eval_data.to_dict()
+        self._opening_active = False
         
         return None
     
@@ -1177,44 +1619,68 @@ class ReviewSystem:
         cp,
         mate,
         last_move: str,
-        last_pgn: str
+        last_pgn: str,
+        move_count: Optional[int] = None,
+        history_snapshot: Optional[List[str]] = None,
+        pgn_snapshot: Optional[List[str]] = None,
+        matrix_snapshot: Optional[List[List[Any]]] = None,
+        force_append: bool = False,
+        request_session_id: Optional[int] = None
     ) -> None:
         """
         Evaluate move using engine comparison.
         
         Calculates EP loss, base classification, and checks for upgrades.
         """
-        # Get previous evaluation
-        if not database.evaluation_history:
-            self.starting_evaluation()
+        if history_snapshot is None:
+            history_snapshot = list(database.game_history)
+        if pgn_snapshot is None:
+            pgn_snapshot = list(database.game_pgn)
+        if matrix_snapshot is None:
+            matrix_snapshot = [list(row) for row in database.matrix.tolist()]
+        if move_count is None:
+            move_count = len(history_snapshot)
         
-        last_eval = database.evaluation_history[-1]
-        
-        # Extract evaluations
-        cp_before = last_eval["cp"]
-        mate_before = last_eval["mate"]
+        # Previous and current evals from explicit history snapshots (not evaluation_history).
+        cp_before, mate_before = self._get_evaluation_for_history(history_snapshot[:-1])
         cp_after = cp
         mate_after = mate
         
-        # Calculate expected points
-        ep_before = self.ep_calc.from_evaluation(cp_before, mate_before)
-        ep_after = self.ep_calc.from_evaluation(cp_after, mate_after)
+        # Convert to mover perspective (auto-detected engine perspective).
+        mover_cp_before = self._to_mover_cp(cp_before, mate_before, color, is_after_move=False)
+        mover_cp_after = self._to_mover_cp(cp_after, mate_after, color, is_after_move=True)
         
-        # Calculate loss
-        ep_loss = self.ep_calc.calculate_loss(ep_before, ep_after)
+        # Calculate losses from mover perspective.
+        ep_loss = self._calculate_mover_ep_loss(mover_cp_before, mover_cp_after)
+        cp_loss = self._calculate_mover_cp_loss(mover_cp_before, mover_cp_after)
         
         # Calculate accuracy
         accuracy = self.accuracy_calc.calculate(ep_loss)
         
-        # Get base classification
-        move_type = self.move_classifier.classify_from_ep_loss(ep_loss)
+        # Get base classification (hybrid EP + CP loss)
+        move_type = self.move_classifier.classify_from_hybrid_loss(
+            ep_loss=ep_loss,
+            cp_loss=cp_loss,
+            mover_cp_before=mover_cp_before,
+            mover_cp_after=mover_cp_after,
+            move_count=move_count,
+            last_pgn=last_pgn
+        )
         
         # Check for upgrades (Brilliant, Great)
         # Only upgrade if base class is good enough
-        if ep_loss < THRESHOLD_EXCELLENT:
+        if move_type in ("best", "excellent") and ep_loss < THRESHOLD_EXCELLENT:
             move_type = self._check_special_upgrades(
-                move_type, ep_loss, last_move, last_pgn,
-                color, cp_before, mate_before
+                base_type=move_type,
+                ep_loss=ep_loss,
+                last_move=last_move,
+                last_pgn=last_pgn,
+                color=color,
+                cp_before=cp_before,
+                mate_before=mate_before,
+                history_snapshot=history_snapshot,
+                pgn_snapshot=pgn_snapshot,
+                after_matrix_snapshot=matrix_snapshot
             )
         
         # Store result
@@ -1223,11 +1689,18 @@ class ReviewSystem:
             cp=cp_after,
             mate=mate_after,
             move_type=move_type,
-            accuracy=accuracy
+            accuracy=accuracy,
+            ep_loss=ep_loss,
+            cp_loss=cp_loss
         )
         
+        with self._lock:
+            if request_session_id is not None and request_session_id != self._session_id:
+                self._log_queue(f"Review stale drop before append: move {move_count}, session {request_session_id}")
+                return
+        
         self.curr_eval = eval_data.to_dict()
-        self._update_evaluation_history()
+        self._update_evaluation_history(force_append=force_append)
     
     def _check_special_upgrades(
         self,
@@ -1237,7 +1710,10 @@ class ReviewSystem:
         last_pgn: str,
         color: str,
         cp_before,
-        mate_before
+        mate_before,
+        history_snapshot: List[str],
+        pgn_snapshot: List[str],
+        after_matrix_snapshot: List[List[Any]]
     ) -> str:
         """
         Check if move should be upgraded to Brilliant or Great.
@@ -1254,14 +1730,14 @@ class ReviewSystem:
         Returns:
             Upgraded classification or base_type
         """
-        # Rebuild board state before move
-        before_board, top_moves = self._rebuild_before_position_data()
+        # Rebuild board state before move for the exact request history.
+        before_board, top_moves = self._rebuild_before_position_data(history_snapshot)
         
         if not before_board or not top_moves:
             return base_type
         
-        # Get board after move
-        after_board = self.board_analyzer._board_from_matrix()
+        # Get board after move from request matrix snapshot
+        after_board = self.board_analyzer._board_from_matrix(after_matrix_snapshot)
         
         # Parse move
         parsed_move = self._parse_uci_move(last_move)
@@ -1273,10 +1749,12 @@ class ReviewSystem:
         opponent_color = "black" if color == "white" else "white"
         
         # Check if in check before move
-        was_in_check = self._was_in_check_before(before_board, mover_color, opponent_color)
+        was_in_check = self._was_in_check_before(
+            before_board, mover_color, opponent_color, pgn_snapshot
+        )
         
         # Check if position was lost
-        already_lost = self._position_was_lost(cp_before, mate_before)
+        already_lost = self._position_was_lost(cp_before, mate_before, mover_color)
         
         # Check Brilliant upgrade
         if self.move_classifier.upgrade_to_brilliant(
@@ -1287,7 +1765,7 @@ class ReviewSystem:
             return "brilliant"
         
         # Check Great upgrade (only if not Brilliant)
-        if self.move_classifier.upgrade_to_great(
+        if base_type == "best" and self.move_classifier.upgrade_to_great(
             ep_loss, last_move, last_pgn, top_moves,
             was_in_check, already_lost
         ):
@@ -1296,6 +1774,82 @@ class ReviewSystem:
         return base_type
     
     # ==================== HELPER METHODS ====================
+
+    @staticmethod
+    def _raw_cp_from_evaluation(cp_value, mate_value) -> Optional[float]:
+        """Convert CP/mate evaluation to a white-centric centipawn-like score."""
+        if isinstance(mate_value, (int, float)):
+            mate = int(mate_value)
+            return float(100000 - abs(mate)) if mate > 0 else float(-100000 + abs(mate))
+        
+        if isinstance(cp_value, (int, float)):
+            return float(cp_value)
+        
+        return None
+
+    def _to_mover_cp(
+        self,
+        cp_value,
+        mate_value,
+        mover_color: str,
+        is_after_move: bool
+    ) -> Optional[float]:
+        """
+        Convert engine evaluation into mover-centric centipawns.
+        
+        For side-to-move perspective engines:
+            - before move: score already from mover perspective
+            - after move: score is opponent perspective, so flip sign
+        
+        For white-centric engines:
+            - white mover: unchanged
+            - black mover: flip sign
+        """
+        raw_cp = self._raw_cp_from_evaluation(cp_value, mate_value)
+        if raw_cp is None:
+            return None
+        
+        if self._eval_perspective == EVAL_PERSPECTIVE_SIDE_TO_MOVE:
+            return -raw_cp if is_after_move else raw_cp
+        
+        return raw_cp if mover_color == "white" else -raw_cp
+
+    def _calculate_mover_ep_loss(
+        self,
+        mover_cp_before: Optional[float],
+        mover_cp_after: Optional[float]
+    ) -> float:
+        """Calculate EP loss directly from mover-centric CP values."""
+        if mover_cp_before is None or mover_cp_after is None:
+            return 0.0
+        
+        ep_before = self.ep_calc.from_centipawns(mover_cp_before)
+        ep_after = self.ep_calc.from_centipawns(mover_cp_after)
+        return max(0.0, ep_before - ep_after)
+
+    @staticmethod
+    def _calculate_mover_cp_loss(
+        mover_cp_before: Optional[float],
+        mover_cp_after: Optional[float]
+    ) -> float:
+        """Calculate CP loss from mover-centric CP values."""
+        if mover_cp_before is None or mover_cp_after is None:
+            return 0.0
+        
+        return max(0.0, mover_cp_before - mover_cp_after)
+
+    def _get_evaluation_for_history(
+        self,
+        history_snapshot: List[str]
+    ) -> Tuple[int | float | str, int | float | str]:
+        """
+        Evaluate position reached by a specific history snapshot.
+        
+        Returns:
+            (cp, mate) tuple
+        """
+        self._sync_review_engine_to_snapshot(history_snapshot)
+        return self._get_current_evaluation()
     
     def _get_current_evaluation(self) -> Tuple[int | float | str, int | float | str]:
         """
@@ -1330,14 +1884,17 @@ class ReviewSystem:
         self,
         before_board: List[List[str]],
         mover_color: str,
-        opponent_color: str
+        opponent_color: str,
+        pgn_snapshot: Optional[List[str]] = None
     ) -> bool:
         """Check if king was in check before the move"""
         king_square = self.board_analyzer._find_king(before_board, mover_color)
         if not king_square:
             # Fallback: check previous PGN for check symbol
-            if len(database.game_pgn) > 1:
-                return "+" in database.game_pgn[-2]
+            if pgn_snapshot is None:
+                pgn_snapshot = list(database.game_pgn)
+            if len(pgn_snapshot) > 1:
+                return "+" in pgn_snapshot[-2]
             return False
         
         attackers = self.board_analyzer._attackers_to_square(
@@ -1345,31 +1902,29 @@ class ReviewSystem:
         )
         return len(attackers) > 0
     
-    def _position_was_lost(self, cp_before, mate_before) -> bool:
-        """Check if position was already lost before move"""
-        # Check centipawn evaluation
-        if isinstance(cp_before, (int, float)):
-            if cp_before < -300:
-                return True
+    def _position_was_lost(self, cp_before, mate_before, mover_color: str) -> bool:
+        """Check if mover was already lost before the move."""
+        mover_cp_before = self._to_mover_cp(cp_before, mate_before, mover_color, is_after_move=False)
+        if mover_cp_before is None:
+            return False
         
-        # Check mate evaluation
-        if isinstance(mate_before, (int, float)):
-            if mate_before < 0:
-                return True
-        
-        return False
+        return mover_cp_before < -300
     
-    def _rebuild_before_position_data(self) -> Tuple[Optional[List[List[str]]], List[dict]]:
+    def _rebuild_before_position_data(
+        self,
+        history_snapshot: Optional[List[str]] = None
+    ) -> Tuple[Optional[List[List[str]]], List[dict]]:
         """
         Rebuild board state before last move and get engine analysis.
         
         Returns:
             (before_board, top_moves) tuple
         """
-        if not database.game_history:
-            return None, []
+        if history_snapshot is None:
+            history_snapshot = list(database.game_history)
         
-        history_snapshot = list(database.game_history)
+        if not history_snapshot:
+            return None, []
         
         try:
             # Reset and replay all moves except last
@@ -1391,13 +1946,13 @@ class ReviewSystem:
             return None, []
         
         finally:
-            # Re-sync to current position
+            # Re-sync to request/current snapshot
             try:
-                self._sync_review_engine_to_history()
+                self._sync_review_engine_to_snapshot(history_snapshot)
             except Exception:
                 pass
     
-    def _update_evaluation_history(self) -> None:
+    def _update_evaluation_history(self, force_append: bool = False) -> None:
         """
         Update database evaluation history with current evaluation.
         
@@ -1412,7 +1967,7 @@ class ReviewSystem:
             return
         
         # Don't add duplicates
-        if curr_eval == db_eval[-1]:
+        if not force_append and curr_eval == db_eval[-1]:
             return
         
         db_eval.append(curr_eval)
@@ -1423,11 +1978,21 @@ class ReviewSystem:
         """
         Queue non-blocking move evaluation.
         
-        Coalesces multiple rapid requests into single evaluation.
+        Queues each move snapshot for ordered per-move evaluation.
         Thread-safe.
         """
+        request = self._build_request_from_database()
+        if request is None:
+            return
+        
         with self._lock:
-            self._evaluation_requested = True
+            # Duplicate suppression for repeated async calls on same move index.
+            if request.move_count <= self._last_enqueued_move_count:
+                return
+            
+            self._request_queue.append(request)
+            self._last_enqueued_move_count = request.move_count
+            self._log_queue(f"Review enqueue: move {request.move_count}, session {request.session_id}")
             
             # Start worker if not already running
             if self._pending_future is None or self._pending_future.done():
@@ -1440,25 +2005,49 @@ class ReviewSystem:
         Continues evaluating while requests are pending.
         """
         while True:
+            should_log_summary = False
+            request: Optional[ReviewRequest] = None
             with self._lock:
-                if not self._evaluation_requested:
+                if not self._request_queue:
                     self._pending_future = None
-                    return
-                self._evaluation_requested = False
+                    should_log_summary = True
+                else:
+                    request = self._request_queue.popleft()
+            
+            if should_log_summary:
+                self.log_post_game_summary_if_ready()
+                return
+            
+            if request is None:
+                # Defensive guard for static analyzers; runtime should not reach here.
+                continue
+            
+            self._log_queue(f"Review dequeue: move {request.move_count}, session {request.session_id}")
+            
+            with self._lock:
+                if request.session_id != self._session_id:
+                    self._log_queue(
+                        f"Review stale skip in drain: move {request.move_count}, "
+                        f"session {request.session_id} != {self._session_id}"
+                    )
+                    continue
             
             # Evaluate outside lock
-            self._evaluate_guarded()
+            self._evaluate_guarded(request)
     
-    def _evaluate_guarded(self) -> None:
+    def _evaluate_guarded(self, request: Optional[ReviewRequest] = None) -> None:
         """
         Evaluate with exception handling.
         
         Logs errors but doesn't crash.
         """
         try:
-            self.evaluate_last_move()
+            if request is not None:
+                self._evaluate_request(request)
+            else:
+                self.evaluate_last_move()
             
-            # Log result
+            # Preserve per-move review log output.
             if database.evaluation_history:
                 latest = database.evaluation_history[-1]
                 database.gamelogger.move(f"Review: {latest}")
@@ -1474,7 +2063,7 @@ class ReviewSystem:
         Should be called before closing game.
         """
         with self._lock:
-            self._evaluation_requested = False
+            self._request_queue.clear()
             self._executor.shutdown(wait=False, cancel_futures=True)
         
         database.gamelogger.game("Review system shutdown")

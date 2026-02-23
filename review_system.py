@@ -99,6 +99,7 @@ BRILLIANT_SACRIFICE_KING_PRESSURE = 2  # Attackers needed for king pressure
 # API configuration
 LICHESS_API_URL = "https://explorer.lichess.ovh/lichess"
 LICHESS_API_TIMEOUT = 3.0
+OPENING_API_CACHE_MAX_ENTRIES = 4096
 
 # Engine configuration
 STOCKFISH_DEPTH = 18
@@ -108,6 +109,7 @@ STOCKFISH_ENGINE_PARAMETERS: Dict[str, str | int | bool] = {
 }
 EVAL_PERSPECTIVE_SIDE_TO_MOVE = "side_to_move"
 EVAL_PERSPECTIVE_WHITE = "white"
+EVALUATION_CACHE_MAX_ENTRIES = 4096
 
 # Starting position FEN
 STARTING_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
@@ -182,6 +184,10 @@ class OpeningBook:
     """
     Manages opening detection using Lichess API and fallback heuristics.
     """
+
+    _api_session = requests.Session()
+    _api_cache: Dict[Tuple[str, str], Optional[str]] = {}
+    _api_lock = Lock()
     
     # First move opening names (fallback when API unavailable)
     FIRST_MOVE_NAMES = {
@@ -207,8 +213,8 @@ class OpeningBook:
         "b1a3": "Sodium Attack",
     }
     
-    @staticmethod
-    def get_opening_from_api(fen: str, play: str = "") -> Optional[str]:
+    @classmethod
+    def get_opening_from_api(cls, fen: str, play: str = "") -> Optional[str]:
         """
         Query Lichess API for opening name.
         
@@ -219,8 +225,14 @@ class OpeningBook:
         Returns:
             Opening name or None if not found/error
         """
+        cache_key = (fen, play)
+        with cls._api_lock:
+            if cache_key in cls._api_cache:
+                return cls._api_cache[cache_key]
+
+        opening_name: Optional[str] = None
         try:
-            response = requests.get(
+            response = cls._api_session.get(
                 LICHESS_API_URL,
                 params={"fen": fen, "play": play},
                 timeout=LICHESS_API_TIMEOUT
@@ -230,11 +242,22 @@ class OpeningBook:
                 data = response.json()
                 opening = data.get("opening")
                 if isinstance(opening, dict):
-                    return opening.get("name")
-            return None
-        except Exception as e:
+                    opening_name = opening.get("name")
+        except Exception:
             # Silently fail - don't spam logs with API errors
-            return None
+            opening_name = None
+
+        with cls._api_lock:
+            if cache_key in cls._api_cache:
+                return cls._api_cache[cache_key]
+
+            if len(cls._api_cache) >= OPENING_API_CACHE_MAX_ENTRIES:
+                # Compact strategy: clear rarely changing opening cache in one shot.
+                cls._api_cache.clear()
+
+            cls._api_cache[cache_key] = opening_name
+
+        return opening_name
     
     @classmethod
     def get_first_move_name(cls, move: str) -> str:
@@ -1188,7 +1211,11 @@ class ReviewSystem:
         self._last_post_game_summary_key: Optional[Tuple[int, str]] = None
         
         # Sync tracking
-        self._synced_history_len: int = 0
+        self._synced_history: Tuple[str, ...] = tuple()
+        self._evaluation_cache: Dict[
+            Tuple[str, ...],
+            Tuple[int | float | str, int | float | str]
+        ] = {}
         self._opening_active: bool = True
         
         # Utility components
@@ -1212,6 +1239,8 @@ class ReviewSystem:
             self._request_queue.clear()
             self._last_enqueued_move_count = 0
             self._last_post_game_summary_key = None
+            self._synced_history = tuple()
+            self._evaluation_cache.clear()
         
         self._opening_active = True
     
@@ -1271,24 +1300,66 @@ class ReviewSystem:
     def _reset_review_engine(self) -> None:
         """Reset Stockfish to starting position"""
         self.stockfish.set_fen_position(STARTING_FEN)
-        self._synced_history_len = 0
+        self._synced_history = tuple()
 
     def _sync_review_engine_to_snapshot(self, history: List[str]) -> None:
         """Synchronize Stockfish to a provided move-history snapshot."""
+        target_history = tuple(history)
+        if target_history == self._synced_history:
+            return
+
+        # Fast path: append only missing moves if target extends current synced line.
+        if (
+            len(target_history) >= len(self._synced_history) and
+            target_history[:len(self._synced_history)] == self._synced_history
+        ):
+            delta = list(target_history[len(self._synced_history):])
+            if delta:
+                try:
+                    self.stockfish.make_moves_from_current_position(delta)
+                    self._synced_history = target_history
+                    return
+                except Exception:
+                    # Fall back to full rebuild if incremental replay fails.
+                    pass
+
         self._reset_review_engine()
-        
-        if history:
-            self.stockfish.make_moves_from_current_position(history)
-        
-        self._synced_history_len = len(history)
+        if target_history:
+            self.stockfish.make_moves_from_current_position(list(target_history))
+        self._synced_history = target_history
     
     def _sync_review_engine_to_history(self) -> None:
         """
         Synchronize Stockfish with game history.
         
-        Always rebuilds from scratch to avoid drift.
+        Uses incremental replay when possible.
         """
         self._sync_review_engine_to_snapshot(list(database.game_history))
+
+    @staticmethod
+    def _history_key(history: List[str]) -> Tuple[str, ...]:
+        """Convert mutable move history snapshot into cache key."""
+        return tuple(history)
+
+    def _cache_evaluation(self, history: List[str], cp, mate) -> None:
+        """Store evaluation for a history snapshot in bounded insertion-ordered cache."""
+        key = self._history_key(history)
+        with self._lock:
+            if key in self._evaluation_cache:
+                del self._evaluation_cache[key]
+            self._evaluation_cache[key] = (cp, mate)
+
+            if len(self._evaluation_cache) > EVALUATION_CACHE_MAX_ENTRIES:
+                oldest_key = next(iter(self._evaluation_cache))
+                del self._evaluation_cache[oldest_key]
+
+    def _get_cached_evaluation(
+        self,
+        history: List[str]
+    ) -> Optional[Tuple[int | float | str, int | float | str]]:
+        """Read cached evaluation for a history snapshot."""
+        with self._lock:
+            return self._evaluation_cache.get(self._history_key(history))
 
     @staticmethod
     def _is_checkmate_from_legal_moves() -> bool:
@@ -1445,6 +1516,7 @@ class ReviewSystem:
         
         self.curr_eval = eval_data.to_dict()
         self._update_evaluation_history()
+        self._cache_evaluation([], cp, mate)
         
         database.gamelogger.init(f"Starting position: CP={cp}, Mate={mate}")
     
@@ -1483,6 +1555,7 @@ class ReviewSystem:
         # Sync Stockfish to request position and get current eval.
         self._sync_review_engine_to_snapshot(request.history)
         cp, mate = self._get_current_evaluation()
+        self._cache_evaluation(request.history, cp, mate)
         
         # Determine who moved.
         color = "white" if request.current_turn == "black" else "black"
@@ -1491,13 +1564,6 @@ class ReviewSystem:
         move_count = request.move_count
         last_move = request.history[-1] if request.history else ""
         last_pgn = request.pgn[-1] if request.pgn else ""
-        
-        # Generate FEN from request snapshot.
-        fen = self.notation_gen.generate_fen(
-            board=request.matrix_snapshot,  # type: ignore[arg-type]
-            side_to_move=request.current_turn[0],  # type: ignore[index]
-            fullmove_number=request.fullmove
-        )
         
         # ===== CLASSIFICATION PRIORITY =====
         
@@ -1516,6 +1582,15 @@ class ReviewSystem:
             self._update_evaluation_history(force_append=True)
             return
         
+        fen: Optional[str] = None
+        if self._opening_active:
+            # FEN is only needed for opening-book lookups.
+            fen = self.notation_gen.generate_fen(
+                board=request.matrix_snapshot,  # type: ignore[arg-type]
+                side_to_move=request.current_turn[0],  # type: ignore[index]
+                fullmove_number=request.fullmove
+            )
+
         # Priority 2: BOOK (opening theory)
         book_result = self._check_book_move(move_count, last_move, last_pgn, color, fen, cp, mate)
         if book_result:
@@ -1563,7 +1638,7 @@ class ReviewSystem:
         last_move: str,
         last_pgn: str,
         color: str,
-        fen: str,
+        fen: Optional[str],
         cp,
         mate
     ) -> Optional[Dict]:
@@ -1580,7 +1655,7 @@ class ReviewSystem:
         # First move is always book (with fallback name)
         if move_count == 1:
             self._opening_active = True
-            opening = self.opening_book.get_opening_from_api(fen)
+            opening = self.opening_book.get_opening_from_api(fen) if fen else None
             if not opening:
                 opening = self.opening_book.get_first_move_name(last_move)
             
@@ -1596,7 +1671,7 @@ class ReviewSystem:
             return eval_data.to_dict()
         
         # API-only policy after move 1.
-        opening = self.opening_book.get_opening_from_api(fen)
+        opening = self.opening_book.get_opening_from_api(fen) if fen else None
         if opening:
             eval_data = EvaluationData(
                 color=color,
@@ -1730,6 +1805,16 @@ class ReviewSystem:
         Returns:
             Upgraded classification or base_type
         """
+        can_try_brilliant = ep_loss < THRESHOLD_BRILLIANT
+        can_try_great = base_type == "best" and ep_loss < THRESHOLD_GREAT
+        if not can_try_brilliant and not can_try_great:
+            return base_type
+
+        # Skip expensive board rebuilds for malformed move strings.
+        parsed_move = self._parse_uci_move(last_move)
+        if not parsed_move:
+            return base_type
+
         # Rebuild board state before move for the exact request history.
         before_board, top_moves = self._rebuild_before_position_data(history_snapshot)
         
@@ -1738,11 +1823,6 @@ class ReviewSystem:
         
         # Get board after move from request matrix snapshot
         after_board = self.board_analyzer._board_from_matrix(after_matrix_snapshot)
-        
-        # Parse move
-        parsed_move = self._parse_uci_move(last_move)
-        if not parsed_move:
-            return base_type
         
         # Get colors
         mover_color = color
@@ -1757,19 +1837,21 @@ class ReviewSystem:
         already_lost = self._position_was_lost(cp_before, mate_before, mover_color)
         
         # Check Brilliant upgrade
-        if self.move_classifier.upgrade_to_brilliant(
-            ep_loss, last_move, last_pgn, parsed_move, top_moves,
-            before_board, after_board, mover_color, opponent_color,
-            was_in_check, already_lost, cp_before
-        ):
-            return "brilliant"
+        if can_try_brilliant:
+            if self.move_classifier.upgrade_to_brilliant(
+                ep_loss, last_move, last_pgn, parsed_move, top_moves,
+                before_board, after_board, mover_color, opponent_color,
+                was_in_check, already_lost, cp_before
+            ):
+                return "brilliant"
         
         # Check Great upgrade (only if not Brilliant)
-        if base_type == "best" and self.move_classifier.upgrade_to_great(
-            ep_loss, last_move, last_pgn, top_moves,
-            was_in_check, already_lost
-        ):
-            return "great"
+        if can_try_great:
+            if self.move_classifier.upgrade_to_great(
+                ep_loss, last_move, last_pgn, top_moves,
+                was_in_check, already_lost
+            ):
+                return "great"
         
         return base_type
     
@@ -1848,8 +1930,14 @@ class ReviewSystem:
         Returns:
             (cp, mate) tuple
         """
+        cached_eval = self._get_cached_evaluation(history_snapshot)
+        if cached_eval is not None:
+            return cached_eval
+
         self._sync_review_engine_to_snapshot(history_snapshot)
-        return self._get_current_evaluation()
+        cp, mate = self._get_current_evaluation()
+        self._cache_evaluation(history_snapshot, cp, mate)
+        return cp, mate
     
     def _get_current_evaluation(self) -> Tuple[int | float | str, int | float | str]:
         """
@@ -1927,10 +2015,9 @@ class ReviewSystem:
             return None, []
         
         try:
-            # Reset and replay all moves except last
-            self.stockfish.set_fen_position(STARTING_FEN)
-            if len(history_snapshot) > 1:
-                self.stockfish.make_moves_from_current_position(history_snapshot[:-1])
+            # Analyze position before last move; sync uses incremental replay when possible.
+            before_history = history_snapshot[:-1]
+            self._sync_review_engine_to_snapshot(before_history)
             
             # Get FEN and top moves
             fen_before = self.stockfish.get_fen_position()

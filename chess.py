@@ -1,9 +1,10 @@
 # chess.py - The Game Entrance
 import random
+from concurrent.futures import ThreadPoolExecutor, Future
 from tkinter import messagebox
 import customtkinter as ctk
 import numpy as np
-from typing import Tuple, Dict, Optional, Literal, Any
+from typing import Tuple, Dict, Optional, Literal, Any, Set
 from dataclasses import dataclass
 from utils import Utilities
 from database.database import database, MoveResult
@@ -91,14 +92,27 @@ class ChessGame:
         self.visual_from: Optional[Tuple] = None
         self.visual_to: Optional[Tuple] = None
         self.visual_to: Optional[Tuple] = None
+        self.selected_square: Optional[Tuple[int, int]] = None
         self.empty_image = ctk.CTkImage(Image.new("RGBA", (1, 1), (0, 0, 0, 0)), size=(1, 1))
         
         # UI elements
         # OPTIMIZED: Using Tuple[int, int] keys to avoid constant string conversions
         self.piece_labels: Dict[Tuple[int, int], ctk.CTkLabel] = {}
         self._ctk_image_cache: Dict[Tuple[str, bool, int], ctk.CTkImage] = {}
+        self._render_state: Dict[Tuple[int, int], Tuple[str, bool, int]] = {}
+        self._current_legal_visual_squares: Set[Tuple[int, int]] = set()
+        self._highlighted_visual_squares: Set[Tuple[int, int]] = set()
+        self._square_color_state: Dict[Tuple[int, int], str] = {}
+        self._all_visual_squares: Set[Tuple[int, int]] = {(row, col) for row in range(8) for col in range(8)}
+        self._last_image_size = 0
+        self._warmed_image_sizes: Set[int] = set()
         self.promotion_labels: Dict[str, ctk.CTkLabel] = {}
         self.chessboard_squares: Dict[Tuple[int, int], ctk.CTkFrame] = {}
+
+        # AI scheduling (non-blocking fetch + stale request guard)
+        self._ai_executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="chess-ai")
+        self._ai_future: Optional[Future[Optional[str]]] = None
+        self._ai_request_token: int = 0
         
         # Start menu tracking
         self.start_menu: Optional[ctk.CTkFrame] = None
@@ -147,7 +161,7 @@ class ChessGame:
     def _setup_window(self, window: ctk.CTk) -> None:
         """Configure window properties"""
         self.utils.fullscreen_window(window)
-        window.minsize(600, 440)
+        window.minsize(750, 550)
     
     def _handle_escape(self) -> None:
         """Handle escape key press"""
@@ -192,6 +206,7 @@ class ChessGame:
         answer = messagebox.askyesno("Warning", "Are you sure you want to close the game?")
         if answer:
             try:
+                self._cancel_pending_ai_work(shutdown_executor=True)
                 self.review.shutdown()
                 self.root.quit()
                 self.root.destroy()
@@ -281,6 +296,7 @@ class ChessGame:
         self._configure_grid()
         self._create_chessboard_squares()
         self._refresh_all_images()
+        self._warm_image_cache_for_size(self._calculate_image_size())
 
         database.gamelogger.game("Chessboard Ready!")
     
@@ -314,10 +330,9 @@ class ChessGame:
 
     def _setup_promotion_images(self, color: str) -> None:
         """Create promotion images"""
-        prefix = "-" if color == "black" else ""
         for label_name in self.promotion_labels:
             self.promotion_labels[label_name].configure(
-                image=self.utils.ctkimage_generator(f"images/{color}/{prefix}{label_name}.png", (50, 50))
+                image=self.utils.ctkimage_generator(f"images/{color}/{label_name}.png", (50, 50))
             )
         self.promoting = True
         self._update_chessboard_position()
@@ -478,6 +493,10 @@ class ChessGame:
         
         self.chessboard_squares.clear()
         self.piece_labels.clear()
+        self._square_color_state.clear()
+        self._render_state.clear()
+        self._current_legal_visual_squares.clear()
+        self._highlighted_visual_squares.clear()
         
         for row in range(8):
             for col in range(8):
@@ -488,6 +507,7 @@ class ChessGame:
                 square.grid(row=row, column=col, sticky="nsew")
                 square.bind("<Button-1>", lambda _, pos=square_pos: self._handle_square_click(pos))
                 self.chessboard_squares[square_pos] = square
+                self._square_color_state[square_pos] = color
                 
                 # 2. Pre-allocate a single label for both piece and legal move dot
                 piece_label = ctk.CTkLabel(square, text="", fg_color="transparent", bg_color="transparent")
@@ -501,14 +521,105 @@ class ChessGame:
     # ==================== PIECE RENDERING ====================
     
     # ==================== PIECE RENDERING ====================
+
+    @staticmethod
+    def _normalize_piece_key(piece: Any) -> str:
+        """Normalize piece id (e.g. '-p1' -> '-p', 0 -> 'empty')."""
+        if piece != 0 and isinstance(piece, str):
+            return piece[:-1]
+        return "empty"
+
+    def _square_base_color(self, visual_square: Tuple[int, int]) -> str:
+        row, col = visual_square
+        return self.style.white_box_color if (row + col) % 2 == 0 else self.style.black_box_color
+
+    def _set_square_color(self, visual_square: Tuple[int, int], color: str) -> None:
+        frame = self.chessboard_squares.get(visual_square)
+        if not frame:
+            return
+        if self._square_color_state.get(visual_square) == color:
+            return
+        frame.configure(fg_color=color, bg_color=color)
+        self._square_color_state[visual_square] = color
+
+    def _get_highlight_targets(self) -> Set[Tuple[int, int]]:
+        targets: Set[Tuple[int, int]] = set()
+        if self.last_from_square and self.last_to_square:
+            targets.add(self._logical_to_visual(self.last_from_square))
+            targets.add(self._logical_to_visual(self.last_to_square))
+        return targets
+
+    def _update_highlights_incremental(self, force: bool = False) -> None:
+        """Update highlight colors by touching only changed squares."""
+        new_highlights = self._get_highlight_targets()
+
+        if force:
+            stale_highlights = set(self._all_visual_squares) - new_highlights
+        else:
+            stale_highlights = self._highlighted_visual_squares - new_highlights
+
+        for visual_sq in stale_highlights:
+            self._set_square_color(visual_sq, self._square_base_color(visual_sq))
+
+        if force:
+            new_or_changed = new_highlights
+        else:
+            new_or_changed = new_highlights - self._highlighted_visual_squares
+
+        for visual_sq in new_or_changed:
+            is_light = (visual_sq[0] + visual_sq[1]) % 2 == 0
+            highlight = self.style.white_highlight if is_light else self.style.black_highlight
+            self._set_square_color(visual_sq, highlight)
+
+        self._highlighted_visual_squares = new_highlights
+
+    def _compute_legal_visual_squares(self, piece_id: Optional[str]) -> Set[Tuple[int, int]]:
+        legal_visual_squares: Set[Tuple[int, int]] = set()
+        if not piece_id:
+            return legal_visual_squares
+
+        legal_moves = self._get_legal_moves_for_piece(piece_id)
+        for move in legal_moves:
+            visual_sq = self._logical_to_visual((int(move[0]), int(move[1])))
+            legal_visual_squares.add(visual_sq)
+
+        return legal_visual_squares
+
+    def _warm_image_cache_for_size(self, size: int) -> None:
+        """Preload piece+legal image variants once per size to avoid first-click hitching."""
+        if size <= 0 or size in self._warmed_image_sizes:
+            return
+
+        piece_variants = ["empty", "p", "r", "n", "b", "q", "k", "-p", "-r", "-n", "-b", "-q", "-k"]
+        for piece_variant in piece_variants:
+            for is_legal in (False, True):
+                piece_for_loader: Any = 0 if piece_variant == "empty" else f"{piece_variant}1"
+                self._get_cached_ctk_image(piece_for_loader, is_legal, size)
+
+        self._warmed_image_sizes.add(size)
+
+    def _refresh_squares(
+        self,
+        visual_squares: Set[Tuple[int, int]],
+        legal_visual_squares: Set[Tuple[int, int]],
+        image_size: int,
+        force: bool = False
+    ) -> None:
+        """Refresh only specified squares using current board state."""
+        if not visual_squares:
+            return
+
+        for visual_sq in visual_squares:
+            row, col = visual_sq
+            piece = self.view_matrix[row, col]
+            is_legal = visual_sq in legal_visual_squares
+            self._render_square(visual_sq, piece, is_legal, image_size, force=force)
+
+        self._last_image_size = image_size
     
     def _get_cached_ctk_image(self, piece: Any, is_legal: bool, size: int) -> Optional[ctk.CTkImage]:
         """Fetch/create and fully cache the CTkImage to prevent lag during rapid clicks"""
-        # Normalize piece string (e.g. "-p1" -> "-p", 0 -> "empty")
-        if piece != 0 and isinstance(piece, str):
-            base_piece = piece[:-1]
-        else:
-            base_piece = "empty"
+        base_piece = self._normalize_piece_key(piece)
             
         cache_key = (base_piece, is_legal, size)
         
@@ -541,14 +652,27 @@ class ChessGame:
             database.gamelogger.error(f"Image load error: {e}")
             return None
 
-    def _render_square(self, visual_square: Tuple[int, int], piece: Any, is_legal: bool, image_size: int) -> None:
-        """Fetch the pre-composited image and apply it"""
+    def _render_square(
+        self,
+        visual_square: Tuple[int, int],
+        piece: Any,
+        is_legal: bool,
+        image_size: int,
+        force: bool = False
+    ) -> None:
+        """Fetch the pre-composited image and apply it only if visual state changed."""
         label = self.piece_labels.get(visual_square)
-        if not label: return
+        if not label:
+            return
+
+        render_key = (self._normalize_piece_key(piece), is_legal, image_size)
+        if not force and self._render_state.get(visual_square) == render_key:
+            return
 
         ctk_img = self._get_cached_ctk_image(piece, is_legal, image_size)
         if ctk_img:
             label.configure(image=ctk_img)
+            self._render_state[visual_square] = render_key
 
     def _calculate_image_size(self) -> int:
         """Calculate appropriate image size ONCE for the whole board"""
@@ -561,49 +685,34 @@ class ChessGame:
         image_size = int(square_size * 0.9)
         return max(image_size, 40)
     
-    def _refresh_all_images(self) -> None:
-        """Statelessly refresh all squares based purely on the current game state"""
-        legal_visual_squares = set()
-        if self.piece_selected:
-            legal_moves = self._get_legal_moves_for_piece(self.piece_selected)
-            for move in legal_moves:
-                visual_sq = self._logical_to_visual((move[0], move[1]))
-                legal_visual_squares.add(visual_sq)
-        
-        # Calculate size ONCE instead of querying widget data 64 times
+    def _refresh_all_images(self, force: bool = False) -> None:
+        """Refresh board visuals, skipping unchanged square renders whenever possible."""
+        legal_visual_squares = self._compute_legal_visual_squares(self.piece_selected)
         current_size = self._calculate_image_size()
-                
-        for row in range(8):
-            for col in range(8):
-                visual_sq = (row, col)
-                piece = self.view_matrix[row, col]
-                is_legal = visual_sq in legal_visual_squares
-                
-                self._render_square(visual_sq, piece, is_legal, current_size)
-                
-        self._reapply_highlights()
+        size_changed = current_size != self._last_image_size
+        self._warm_image_cache_for_size(current_size)
+
+        if force or size_changed or not self._render_state:
+            squares_to_refresh = set(self._all_visual_squares)
+            force_render = True
+        else:
+            squares_to_refresh = self._current_legal_visual_squares.symmetric_difference(legal_visual_squares)
+            for row in range(8):
+                for col in range(8):
+                    visual_sq = (row, col)
+                    piece = self.view_matrix[row, col]
+                    render_key = (self._normalize_piece_key(piece), visual_sq in legal_visual_squares, current_size)
+                    if self._render_state.get(visual_sq) != render_key:
+                        squares_to_refresh.add(visual_sq)
+            force_render = False
+
+        self._current_legal_visual_squares = legal_visual_squares
+        self._refresh_squares(squares_to_refresh, legal_visual_squares, current_size, force=force_render)
+        self._update_highlights_incremental(force=force or size_changed)
     
     def _reapply_highlights(self) -> None:
-        """Reapply move highlights dynamically based on current board orientation"""
-        # 1. Reset ALL squares to their base colors (clears any stale visual highlights safely)
-        for row in range(8):
-            for col in range(8):
-                is_light = (row + col) % 2 == 0
-                base_color = self.style.white_box_color if is_light else self.style.black_box_color
-                frame = self.chessboard_squares.get((row, col))
-                if frame:
-                    frame.configure(fg_color=base_color)
-
-        # 2. Apply highlights to the correct visual squares
-        if self.last_from_square and self.last_to_square:
-            for logical_square in [self.last_from_square, self.last_to_square]:
-                visual_sq = self._logical_to_visual(logical_square) # type: ignore
-                frame = self.chessboard_squares.get(visual_sq)
-                if frame:
-                    v_row, v_col = visual_sq
-                    is_light = (v_row + v_col) % 2 == 0
-                    highlight_color = self.style.white_highlight if is_light else self.style.black_highlight
-                    frame.configure(fg_color=highlight_color)
+        """Compatibility wrapper for full highlight reapplication."""
+        self._update_highlights_incremental(force=True)
 
     # ==================== START MENU ====================
     
@@ -848,10 +957,13 @@ class ChessGame:
             database.gamelogger.game(f"VS AI | ELO: {elo} | Color: {color}")
             
             # Configure AI
+            if database.stockfish is None:
+                self.utils.ai.add_stockfish()
             self.utils.ai.configure_strength(elo)
+            self._cancel_pending_ai_work()
                 
             if self.stockfish_chance:
-                self.root.after(500, self._execute_stockfish_move)
+                self._execute_stockfish_move()
         
         button_width = int(width * 0.3)
         button_height = int(height * 0.06)
@@ -1015,7 +1127,7 @@ class ChessGame:
         if self.game_mode == "vs_ai" and self.vs_ai_configurations:
             ai_color = "black" if self.vs_ai_configurations["color"] == "white" else "white"
             if database.current_turn == ai_color:
-                self.root.after(500, self._execute_stockfish_move)
+                self._execute_stockfish_move()
     
     def _get_promoted_piece(self, promotion_choice: str, is_black: bool) -> str:
         """Convert promotion choice (q, r, b, n) to piece identifier"""
@@ -1230,6 +1342,7 @@ class ChessGame:
     def _start_new_game(self, overlay: ctk.CTkFrame) -> None:
         """Start a new game by resetting state"""
         overlay.destroy()
+        self._cancel_pending_ai_work()
         
         if hasattr(self, '_game_over_menu_btn'):
             self._game_over_menu_btn.destroy()
@@ -1242,6 +1355,7 @@ class ChessGame:
         self.promoting = False
         self.promoting_square = None
         self.piece_selected = None
+        self.selected_square = None
         self._legal_moves_update_scheduled = False
         self.flipped = False
         self.settings_open = False
@@ -1249,6 +1363,11 @@ class ChessGame:
         self.last_from_square = None
         self.last_to_square = None
         self.view_matrix = database.matrix
+        self._current_legal_visual_squares.clear()
+        self._highlighted_visual_squares.clear()
+        self._render_state.clear()
+        self._square_color_state = {square: self._square_base_color(square) for square in self._all_visual_squares}
+        self._last_image_size = 0
         
         for label in self.promotion_labels.values():
             label.configure(image=None)
@@ -1259,18 +1378,19 @@ class ChessGame:
         self._show_start_menu()
         database.gamelogger.game("New game started!")
 
-    def _execute_move(self, from_square: Tuple[int, int], to_square: Tuple[int, int], base_piece: Optional[str] = None) -> None:
+    def _execute_move(self, from_square: Tuple[int, int], to_square: Tuple[int, int], base_piece: Optional[str] = None) -> bool:
         """Execute a piece move on the board - delegates to centralized state manager"""
         piece = database.matrix[from_square[0], from_square[1]]
         
         if piece == 0 or not isinstance(piece, str):
             database.gamelogger.error("Error: No piece at source square")
             self.piece_selected = None
+            self.selected_square = None
             self._refresh_all_images()
-            return
+            return False
         
         if not self._is_legal_move(piece, to_square):
-            return
+            return False
 
         legal_mvs = database.get_legal_moves(database.current_turn)
         if len(legal_mvs) == 1 and len(legal_mvs.get(piece, [])) == 1:
@@ -1283,7 +1403,7 @@ class ChessGame:
             # For promotion: switch turn first, then enter promotion UI
             promotion_color = "black" if "-" in piece else "white"
             self._start_promotion(promotion_color, to_square, from_square, base_piece)
-            return
+            return True
         
         # For all other moves: use the centralized state manager
         result = database.state_manager.execute_move(from_square, to_square)
@@ -1291,8 +1411,9 @@ class ChessGame:
         if result is None:
             database.gamelogger.error("Move execution failed")
             self.piece_selected = None
+            self.selected_square = None
             self._refresh_all_images()
-            return
+            return False
         
         # Generate notation based on move type
         chess_notation = self._generate_chess_notation(result)
@@ -1300,18 +1421,55 @@ class ChessGame:
         
         # UI updates
         self.piece_selected = None
+        self.selected_square = None
+        previous_legal_visuals = set(self._current_legal_visual_squares)
+        previous_flipped = self.flipped
+
         if self.flip_allowed:
             self._flip_board(database.current_turn)
+        orientation_changed = self.flipped != previous_flipped
         
         self._apply_move_highlights(from_square, to_square)
-        self._refresh_all_images()
+
+        if orientation_changed:
+            self._current_legal_visual_squares = set()
+            self._refresh_all_images(force=True)
+        else:
+            current_size = self._calculate_image_size()
+            size_changed = current_size != self._last_image_size
+            self._warm_image_cache_for_size(current_size)
+
+            changed_logical_squares: Set[Tuple[int, int]] = {from_square, to_square}
+
+            if result.is_en_passant:
+                changed_logical_squares.add((from_square[0], to_square[1]))
+
+            if result.is_castling:
+                row = to_square[0]
+                if to_square[1] == 6:
+                    changed_logical_squares.update({(row, 7), (row, 5)})
+                else:
+                    changed_logical_squares.update({(row, 0), (row, 3)})
+
+            changed_visual_squares = {self._logical_to_visual(square) for square in changed_logical_squares}
+            changed_visual_squares.update(previous_legal_visuals)
+
+            self._current_legal_visual_squares = set()
+            if size_changed:
+                self._refresh_squares(set(self._all_visual_squares), set(), current_size, force=True)
+            else:
+                self._refresh_squares(changed_visual_squares, set(), current_size)
+
+            self._update_highlights_incremental()
         
         # Store move info for notation generation after legal moves update
         self._pending_move = (from_square, to_square, piece, result.is_capture, chess_notation, stockfish_notation)
         
         if not self._legal_moves_update_scheduled:
             self._legal_moves_update_scheduled = True
-            self.root.after(100, self._delayed_legal_moves_update)
+            self.root.after_idle(self._delayed_legal_moves_update)
+
+        return True
 
     def _generate_chess_notation(self, result: 'MoveResult') -> str:
         """Generate chess notation for a move"""
@@ -1337,7 +1495,6 @@ class ChessGame:
         """Update legal moves after delay"""
         self.utils.legal_moves.update_legal_moves(database.matrix)
         self._legal_moves_update_scheduled = False
-        self._refresh_all_images()
         
         # Process pending move notation after legal moves are updated
         if hasattr(self, '_pending_move') and self._pending_move:
@@ -1366,8 +1523,7 @@ class ChessGame:
             if self.game_mode == "vs_ai" and self.vs_ai_configurations:
                 ai_color = "black" if self.vs_ai_configurations["color"] == "white" else "white"
                 if database.current_turn == ai_color:
-                    # Small delay for visual clarity
-                    self.root.after(500, self._execute_stockfish_move)
+                    self._execute_stockfish_move()
 
 
     def _flip_board(self, color: str) -> None:
@@ -1548,16 +1704,9 @@ class ChessGame:
 
     def _refresh_board_colors(self) -> None:
         """Refresh board colors after change"""
-        color1 = self.style.white_box_color
-        color2 = self.style.black_box_color
-        
-        for row in range(8):
-            for col in range(8):
-                self.chessboard_squares[(row, col)].configure(fg_color=color1, bg_color=color1)
-                color1, color2 = color2, color1
-            color1, color2 = color2, color1
-        
-        self._reapply_highlights()
+        for square in self._all_visual_squares:
+            self._set_square_color(square, self._square_base_color(square))
+        self._update_highlights_incremental(force=True)
 
     def _close_settings_overlay(self, overlay: ctk.CTkFrame) -> None:
         """Close settings overlay"""
@@ -1574,34 +1723,111 @@ class ChessGame:
         logical_square = self._visual_to_logical(visual_square)
         piece = database.matrix[logical_square[0], logical_square[1]]
         piece_color = "white" if isinstance(piece, str) and '-' not in piece else "black" if piece != 0 else None
+        previous_legal_visuals = set(self._current_legal_visual_squares)
         
         if piece != 0 and isinstance(piece, str) and piece_color == database.current_turn:
             self.piece_selected = piece
-            self._refresh_all_images()
+            self.selected_square = logical_square
+
+            new_legal_visuals = self._compute_legal_visual_squares(self.piece_selected)
+            current_size = self._calculate_image_size()
+            size_changed = current_size != self._last_image_size
+            self._warm_image_cache_for_size(current_size)
+
+            self._current_legal_visual_squares = new_legal_visuals
+            if size_changed or not self._render_state:
+                self._refresh_squares(set(self._all_visual_squares), new_legal_visuals, current_size, force=True)
+            else:
+                changed_visuals = previous_legal_visuals.symmetric_difference(new_legal_visuals)
+                self._refresh_squares(changed_visuals, new_legal_visuals, current_size)
+
+            self._update_highlights_incremental()
+            return
         else:
             if self.piece_selected and isinstance(self.piece_selected, str):
                 try:
-                    from_square = self.utils.legal_moves.search_piece(self.piece_selected, database.matrix)
-                    self._execute_move(from_square, logical_square)
+                    from_square = (
+                        self.selected_square
+                        if self.selected_square is not None
+                        else self.utils.legal_moves.search_piece(self.piece_selected, database.matrix)
+                    )
+                    moved = self._execute_move(from_square, logical_square)
+                    if moved:
+                        return
                 except ValueError as e:
                     database.gamelogger.error(f"Piece not found: {e}")
                     self.piece_selected = None
-                    self._refresh_all_images()
-                    return
+                    self.selected_square = None
             
             self.piece_selected = None
-            self._refresh_all_images()
+            self.selected_square = None
+            self._current_legal_visual_squares = set()
+
+            current_size = self._calculate_image_size()
+            size_changed = current_size != self._last_image_size
+            self._warm_image_cache_for_size(current_size)
+
+            if size_changed or not self._render_state:
+                self._refresh_squares(set(self._all_visual_squares), set(), current_size, force=True)
+            else:
+                self._refresh_squares(previous_legal_visuals, set(), current_size)
+
+            self._update_highlights_incremental()
     
-    def _execute_stockfish_move(self) -> None:
-        """Execute Stockfish move"""
-        move = self.utils.ai.get_ai_move()
-        
+    def _cancel_pending_ai_work(self, shutdown_executor: bool = False) -> None:
+        """Invalidate pending AI tasks and optionally shutdown executor."""
+        self._ai_request_token += 1
+        if self._ai_future and not self._ai_future.done():
+            self._ai_future.cancel()
+        self._ai_future = None
+
+        if shutdown_executor:
+            try:
+                self._ai_executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+
+    def _get_ai_color(self) -> Optional[str]:
+        if not self.vs_ai_configurations:
+            return None
+        return "black" if self.vs_ai_configurations["color"] == "white" else "white"
+
+    def _poll_ai_move_result(self, request_token: int) -> None:
+        if request_token != self._ai_request_token or self._ai_future is None:
+            return
+
+        if not self._ai_future.done():
+            self.root.after(25, lambda token=request_token: self._poll_ai_move_result(token))
+            return
+
+        future = self._ai_future
+        self._ai_future = None
+
+        try:
+            move = future.result()
+        except Exception as e:
+            database.gamelogger.error(f"AI move fetch failed: {e}")
+            move = None
+
+        if request_token != self._ai_request_token:
+            return
+
         if not move:
             database.gamelogger.ai("Stockfish returned no move!")
             return
-        
+
         database.gamelogger.move(f"Stockfish plays: {move}")
-        
+        delay = random.randint(150, 350)
+        self.root.after(delay, lambda mv=move, token=request_token: self._apply_ai_move(mv, token))
+
+    def _apply_ai_move(self, move: str, request_token: int) -> None:
+        if request_token != self._ai_request_token:
+            return
+
+        ai_color = self._get_ai_color()
+        if ai_color is None or database.current_turn != ai_color:
+            return
+
         from_sq = move[:2]
         to_sq = move[2:4]
         base = move[-1] if len(move) == 5 else None
@@ -1609,24 +1835,21 @@ class ChessGame:
         from_square = self.utils.coords.chess_to_matrix(from_sq)
         to_square = self.utils.coords.chess_to_matrix(to_sq)
         promotion = base.lower() if base else None
+        self.root.after(500, lambda from_square=from_square, to_square=to_square, promotion=promotion: self._execute_move(from_square, to_square, promotion))
 
-        if self.vs_ai_configurations:
-            elo = self.vs_ai_configurations.get("elo", 1600)
-            
-            # Lower ELO = faster thinking
-            if elo < 1000:
-                delay = random.randint(200, 800)   # Beginner thinks fast
-            elif elo < 1600:
-                delay = random.randint(400, 1100)  # Intermediate
-            elif elo < 2200:
-                delay = random.randint(700, 1600)  # Advanced
-            else:
-                delay = random.randint(900, 2000) # Master/GM thinks longer
-        else:
-            delay = 1000  # Default
-        
-        self.root.after(delay, lambda: self._execute_move(from_square, to_square, promotion))
-        # The cycle continues through _delayed_legal_moves_update
+    def _execute_stockfish_move(self) -> None:
+        """Queue asynchronous Stockfish move fetch without blocking UI thread."""
+        ai_color = self._get_ai_color()
+        if ai_color is None or database.current_turn != ai_color:
+            return
+
+        if self._ai_future and not self._ai_future.done():
+            return
+
+        self._ai_request_token += 1
+        request_token = self._ai_request_token
+        self._ai_future = self._ai_executor.submit(self.utils.ai.get_ai_move)
+        self._poll_ai_move_result(request_token)
 
 
 if __name__ == "__main__":

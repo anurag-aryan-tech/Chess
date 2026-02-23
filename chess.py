@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from utils import Utilities
 from database.database import database, MoveResult
 from review_system import ReviewSystem
+from PIL import Image
 
 @dataclass
 class STYLE_CONFIG:
@@ -89,10 +90,13 @@ class ChessGame:
         self.last_to_square = None
         self.visual_from: Optional[Tuple] = None
         self.visual_to: Optional[Tuple] = None
+        self.visual_to: Optional[Tuple] = None
+        self.empty_image = ctk.CTkImage(Image.new("RGBA", (1, 1), (0, 0, 0, 0)), size=(1, 1))
         
         # UI elements
-        self.piece_labels: Dict[str, ctk.CTkLabel] = {}
-        self.legal_move_indicators: Dict[str, ctk.CTkLabel] = {}
+        # OPTIMIZED: Using Tuple[int, int] keys to avoid constant string conversions
+        self.piece_labels: Dict[Tuple[int, int], ctk.CTkLabel] = {}
+        self._ctk_image_cache: Dict[Tuple[str, bool, int], ctk.CTkImage] = {}
         self.promotion_labels: Dict[str, ctk.CTkLabel] = {}
         self.chessboard_squares: Dict[Tuple[int, int], ctk.CTkFrame] = {}
         
@@ -125,7 +129,6 @@ class ChessGame:
     @property
     def matrix(self) -> np.ndarray:
         return database.matrix
-
 
     # ==================== WINDOW MANAGEMENT ====================
     
@@ -175,7 +178,7 @@ class ChessGame:
         # Update chessboard position
         self._update_chessboard_position()
 
-        # FIX: Recreate start menu only if game hasn't started
+        # Recreate start menu only if game hasn't started
         if self.game_mode is None and self.start_menu and self.start_menu.winfo_exists():
             self._refresh_start_menu()
         
@@ -277,7 +280,6 @@ class ChessGame:
         self._update_chessboard_position()
         self._configure_grid()
         self._create_chessboard_squares()
-        self._render_all_pieces()
         self._refresh_all_images()
 
         database.gamelogger.game("Chessboard Ready!")
@@ -468,121 +470,140 @@ class ChessGame:
         for i in range(8):
             self.chessboard_frame.rowconfigure(i, weight=1)
             self.chessboard_frame.columnconfigure(i, weight=1)
-    
+
     def _create_chessboard_squares(self) -> None:
-        """Create all 64 chessboard squares with alternating colors"""
+        """Create all 64 chessboard squares with alternating colors and a single label per square"""
         color = self.style.white_box_color
         color2 = self.style.black_box_color
         
+        self.chessboard_squares.clear()
+        self.piece_labels.clear()
+        
         for row in range(8):
             for col in range(8):
+                square_pos = (row, col)
+                
+                # 1. Create the background square
                 square = ctk.CTkFrame(self.chessboard_frame, fg_color=color, bg_color=color)
                 square.grid(row=row, column=col, sticky="nsew")
-                square.bind("<Button-1>", lambda _, pos=(row, col): self._handle_square_click(pos))
-                self.chessboard_squares[(row, col)] = square
+                square.bind("<Button-1>", lambda _, pos=square_pos: self._handle_square_click(pos))
+                self.chessboard_squares[square_pos] = square
+                
+                # 2. Pre-allocate a single label for both piece and legal move dot
+                piece_label = ctk.CTkLabel(square, text="", fg_color="transparent", bg_color="transparent")
+                piece_label.place(relx=0.5, rely=0.5, anchor="center")
+                piece_label.bind("<Button-1>", lambda _, pos=square_pos: self._handle_square_click(pos))
+                self.piece_labels[square_pos] = piece_label
+
                 color, color2 = color2, color
             color, color2 = color2, color
 
     # ==================== PIECE RENDERING ====================
     
-    def _render_all_pieces(self) -> None:
-        """Render all pieces on the board"""
-        for row in range(8):
-            for col in range(8):
-                piece = self.view_matrix[row, col]
-                if piece != 0:
-                    self._add_piece_to_square((row, col), piece)
-        
-    def _add_piece_to_square(self, square: Tuple[int, int], piece: str) -> None:
-        """Add a piece image to a specific square"""
-        color = "black" if '-' in piece else "white"
-        path = f"images/{color}/{piece[:-1]}.png"
-        
-        image_size = self._calculate_image_size(square)
-        image = self.utils.ctkimage_generator(path, size=(image_size, image_size))
-        
-        label = ctk.CTkLabel(
-            self.chessboard_squares[square],
-            image=image,
-            text="",
-            fg_color="transparent",
-            bg_color="transparent"
-        )
-        label.place(relx=0.5, rely=0.5, anchor="center")
-        label.bind("<Button-1>", lambda _, pos=square: self._handle_square_click(pos))
-        self.piece_labels[str(square)] = label
+    # ==================== PIECE RENDERING ====================
     
-    def _add_legal_move_indicator(self, square: Tuple[int, int]) -> None:
-        """Add a dot indicator for a legal move"""
-        image_size = self._calculate_image_size(square)
-        image = self.utils.ctkimage_generator("images/dot.png", size=(image_size, image_size))
+    def _get_cached_ctk_image(self, piece: Any, is_legal: bool, size: int) -> Optional[ctk.CTkImage]:
+        """Fetch/create and fully cache the CTkImage to prevent lag during rapid clicks"""
+        # Normalize piece string (e.g. "-p1" -> "-p", 0 -> "empty")
+        if piece != 0 and isinstance(piece, str):
+            base_piece = piece[:-1]
+        else:
+            base_piece = "empty"
+            
+        cache_key = (base_piece, is_legal, size)
         
-        label = ctk.CTkLabel(
-            self.chessboard_squares[square],
-            image=image,
-            text="",
-            fg_color="transparent",
-            bg_color="transparent"
-        )
-        label.place(relx=0.5, rely=0.5, anchor="center")
-        label.bind("<Button-1>", lambda _, pos=square: self._handle_square_click(pos))
-        self.legal_move_indicators[str(square)] = label
-    
-    def _calculate_image_size(self, square: Tuple[int, int]) -> int:
-        """Calculate appropriate image size based on square dimensions"""
-        square_frame = self.chessboard_squares[square]
+        if cache_key in self._ctk_image_cache:
+            return self._ctk_image_cache[cache_key]
+            
+        try:
+            # 1. Generate Base PIL Image
+            if base_piece == "empty":
+                final_pil = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+            else:
+                color = "black" if '-' in base_piece else "white"
+                path = f"images/{color}/{base_piece.replace('-', '')}.png"
+                final_pil = Image.open(path).convert("RGBA").resize((size, size), Image.Resampling.LANCZOS)
+                
+            # 2. Add Dot if legal
+            if is_legal:
+                dot_pil = Image.open("images/dot.png").convert("RGBA").resize((size, size), Image.Resampling.LANCZOS)
+                if base_piece == "empty":
+                    final_pil = dot_pil
+                else:
+                    final_pil = Image.alpha_composite(final_pil, dot_pil)
+                    
+            # 3. Create CTkImage and Cache it permanently for this size
+            ctk_img = ctk.CTkImage(final_pil, size=(size, size))
+            self._ctk_image_cache[cache_key] = ctk_img
+            return ctk_img
+            
+        except Exception as e:
+            database.gamelogger.error(f"Image load error: {e}")
+            return None
+
+    def _render_square(self, visual_square: Tuple[int, int], piece: Any, is_legal: bool, image_size: int) -> None:
+        """Fetch the pre-composited image and apply it"""
+        label = self.piece_labels.get(visual_square)
+        if not label: return
+
+        ctk_img = self._get_cached_ctk_image(piece, is_legal, image_size)
+        if ctk_img:
+            label.configure(image=ctk_img)
+
+    def _calculate_image_size(self) -> int:
+        """Calculate appropriate image size ONCE for the whole board"""
+        square_frame = self.chessboard_squares.get((0, 0))
+        if not square_frame: return 80
+            
         square_size = min(square_frame.winfo_width(), square_frame.winfo_height())
-        
-        if square_size <= 1:
-            return 80
+        if square_size <= 1: return 80
         
         image_size = int(square_size * 0.9)
         return max(image_size, 40)
     
-    def _clear_piece_from_square(self, square: Tuple[int, int]) -> None:
-        """Remove piece image from a square"""
-        label_key = str(square)
-        if label_key in self.piece_labels:
-            self.piece_labels[label_key].destroy()
-            del self.piece_labels[label_key]
-    
-    def _clear_all_legal_move_indicators(self) -> None:
-        """Remove all legal move indicators"""
-        for label in self.legal_move_indicators.values():
-            label.destroy()
-        self.legal_move_indicators.clear()
-    
-    def _clear_all_pieces(self) -> None:
-        """Remove all piece images from the board"""
-        for label in self.piece_labels.values():
-            label.destroy()
-        self.piece_labels.clear()
-    
     def _refresh_all_images(self) -> None:
-        """Refresh all piece and indicator images after resize"""
-        self._clear_all_pieces()
-        self._render_all_pieces()
-        
+        """Statelessly refresh all squares based purely on the current game state"""
+        legal_visual_squares = set()
         if self.piece_selected:
             legal_moves = self._get_legal_moves_for_piece(self.piece_selected)
-            self._clear_all_legal_move_indicators()
-            self._show_legal_moves(legal_moves)
+            for move in legal_moves:
+                visual_sq = self._logical_to_visual((move[0], move[1]))
+                legal_visual_squares.add(visual_sq)
         
+        # Calculate size ONCE instead of querying widget data 64 times
+        current_size = self._calculate_image_size()
+                
+        for row in range(8):
+            for col in range(8):
+                visual_sq = (row, col)
+                piece = self.view_matrix[row, col]
+                is_legal = visual_sq in legal_visual_squares
+                
+                self._render_square(visual_sq, piece, is_legal, current_size)
+                
         self._reapply_highlights()
     
     def _reapply_highlights(self) -> None:
-        """Reapply move highlights after board refresh"""
-        if self.last_from_square and self.last_to_square:
-            for square_data, highlight in [
-                (self.last_from_square, True),
-                (self.last_to_square, True)
-            ]:
-                row, col, _ = square_data
+        """Reapply move highlights dynamically based on current board orientation"""
+        # 1. Reset ALL squares to their base colors (clears any stale visual highlights safely)
+        for row in range(8):
+            for col in range(8):
+                is_light = (row + col) % 2 == 0
+                base_color = self.style.white_box_color if is_light else self.style.black_box_color
                 frame = self.chessboard_squares.get((row, col))
                 if frame:
-                    is_light = (row + col) % 2 == 0
-                    color = self.style.white_highlight if is_light else self.style.black_highlight
-                    frame.configure(fg_color=color)
+                    frame.configure(fg_color=base_color)
+
+        # 2. Apply highlights to the correct visual squares
+        if self.last_from_square and self.last_to_square:
+            for logical_square in [self.last_from_square, self.last_to_square]:
+                visual_sq = self._logical_to_visual(logical_square) # type: ignore
+                frame = self.chessboard_squares.get(visual_sq)
+                if frame:
+                    v_row, v_col = visual_sq
+                    is_light = (v_row + v_col) % 2 == 0
+                    highlight_color = self.style.white_highlight if is_light else self.style.black_highlight
+                    frame.configure(fg_color=highlight_color)
 
     # ==================== START MENU ====================
     
@@ -697,7 +718,7 @@ class ChessGame:
         event.widget.configure(cursor=style)
     
     def _refresh_start_menu(self) -> None:
-        """ FIX: Refresh start menu on resize"""
+        """ Refresh start menu on resize"""
         if self.start_menu:
             self.start_menu.destroy()
         self._show_start_menu()
@@ -860,7 +881,7 @@ class ChessGame:
         )
     
     def _refresh_vs_ai_menu(self) -> None:
-        """FIX: Refresh vs AI menu on resize"""
+        """Refresh vs AI menu on resize"""
         if self.vs_ai_menu:
             self.vs_ai_menu.destroy()
         self._show_vs_ai_menu()
@@ -875,13 +896,6 @@ class ChessGame:
         color = "white" if '-' not in piece else "black"
         legal_moves_dict = database.get_legal_moves(color)
         return legal_moves_dict.get(piece, np.array([]))
-    
-    def _show_legal_moves(self, legal_moves: np.ndarray) -> None:
-        """Display legal move indicators on the board"""
-        for move in legal_moves:
-            logical_square = (move[0], move[1])
-            visual_square = self._logical_to_visual(logical_square)
-            self._add_legal_move_indicator(visual_square)
     
     def _is_legal_move(self, piece: str, target_square: Tuple[int, int]) -> bool:
         """Check if a move is legal for the given piece"""
@@ -1225,14 +1239,6 @@ class ChessGame:
         self.review.reset_async_state()
         self.utils = Utilities()
 
-        if self.last_to_square and self.last_from_square:
-            for row, col, _ in [self.last_from_square, self.last_to_square]:
-                frame = self.chessboard_squares.get((row, col))
-
-                if frame:
-                    color = self.style.white_box_color if (row + col) % 2 == 0 else self.style.black_box_color
-                    frame.configure(fg_color=color)
-        
         self.promoting = False
         self.promoting_square = None
         self.piece_selected = None
@@ -1244,18 +1250,14 @@ class ChessGame:
         self.last_to_square = None
         self.view_matrix = database.matrix
         
-        self._clear_all_pieces()
-        self._clear_all_legal_move_indicators()
-        
         for label in self.promotion_labels.values():
             label.configure(image=None)
         
-        self._render_all_pieces()
+        self._refresh_all_images()
         self.utils.legal_moves.update_legal_moves(database.matrix)
 
         self._show_start_menu()
         database.gamelogger.game("New game started!")
-
 
     def _execute_move(self, from_square: Tuple[int, int], to_square: Tuple[int, int], base_piece: Optional[str] = None) -> None:
         """Execute a piece move on the board - delegates to centralized state manager"""
@@ -1264,7 +1266,7 @@ class ChessGame:
         if piece == 0 or not isinstance(piece, str):
             database.gamelogger.error("Error: No piece at source square")
             self.piece_selected = None
-            self._clear_all_legal_move_indicators()
+            self._refresh_all_images()
             return
         
         if not self._is_legal_move(piece, to_square):
@@ -1289,7 +1291,7 @@ class ChessGame:
         if result is None:
             database.gamelogger.error("Move execution failed")
             self.piece_selected = None
-            self._clear_all_legal_move_indicators()
+            self._refresh_all_images()
             return
         
         # Generate notation based on move type
@@ -1298,14 +1300,11 @@ class ChessGame:
         
         # UI updates
         self.piece_selected = None
-        self._clear_all_legal_move_indicators()
-
         if self.flip_allowed:
             self._flip_board(database.current_turn)
         
-        self._clear_all_pieces()
         self._apply_move_highlights(from_square, to_square)
-        self._render_all_pieces()
+        self._refresh_all_images()
         
         # Store move info for notation generation after legal moves update
         self._pending_move = (from_square, to_square, piece, result.is_capture, chess_notation, stockfish_notation)
@@ -1330,36 +1329,9 @@ class ChessGame:
             return self.utils.notations.chess_notation(piece, to_square, capture=is_capture, from_square=from_square, disambiguation=disambiguation)
 
     def _apply_move_highlights(self, from_square: Tuple[int, int], to_square: Tuple[int, int]) -> None:
-        """Apply highlighting to the last move squares"""
-        def get_original_color(square: Tuple[int, int]) -> str:
-            row, col = square
-            return self.style.white_box_color if (row + col) % 2 == 0 else self.style.black_box_color
-
-        def get_highlight_color(square: Tuple[int, int]) -> str:
-            row, col = square
-            return self.style.white_highlight if (row + col) % 2 == 0 else self.style.black_highlight
-
-        # Clear previous highlights
-        if self.last_from_square and self.last_to_square:
-            for row, col, _ in [self.last_from_square, self.last_to_square]:
-                frame = self.chessboard_squares.get((row, col))
-                if frame:
-                    frame.configure(fg_color=get_original_color((row, col)))
-
-        # Apply new highlights
-        visual_from = self._logical_to_visual(from_square)
-        visual_to = self._logical_to_visual(to_square)
-
-        from_frame = self.chessboard_squares.get(visual_from)
-        to_frame = self.chessboard_squares.get(visual_to)
-
-        if from_frame and to_frame:
-            from_frame.configure(fg_color=get_highlight_color(visual_from))
-            to_frame.configure(fg_color=get_highlight_color(visual_to))
-            self.last_from_square = (visual_from[0], visual_from[1], None)
-            self.last_to_square = (visual_to[0], visual_to[1], None)
-        
-
+        """Store logical coordinates of the last move. Visuals are handled by _reapply_highlights."""
+        self.last_from_square = from_square
+        self.last_to_square = to_square
 
     def _delayed_legal_moves_update(self) -> None:
         """Update legal moves after delay"""
@@ -1553,21 +1525,16 @@ class ChessGame:
         back_btn.place(relx=0.5, rely=0.8, anchor="center", relwidth=0.4, relheight=0.12)
 
     def _toggle_flip_board(self) -> None:
-        """Toggle board flip from settings"""
         self._flip_board("black" if not self.flipped else "white")
-        self._clear_all_pieces()
-        self._render_all_pieces()
+        self._refresh_all_images()
 
     def _toggle_flip_allowed(self) -> None:
         self.flip_allowed = not self.flip_allowed
-
         if not self.flip_allowed:
             self._flip_board("white")
         else:
             self._flip_board(database.current_turn)
-        
-        self._clear_all_pieces()
-        self._render_all_pieces()
+        self._refresh_all_images()
 
     def _change_white_color(self, color: str) -> None:
         """Change white square color"""
@@ -1601,22 +1568,16 @@ class ChessGame:
         self.root.bind("<Escape>", lambda _: self._handle_escape())
     
     def _handle_square_click(self, visual_square: Tuple[int, int]) -> None:
-        """Handle click on a chessboard square"""
         if self.promoting or self.disabled_color == database.current_turn:
             return
         
         logical_square = self._visual_to_logical(visual_square)
         piece = database.matrix[logical_square[0], logical_square[1]]
-        
-        piece_color = None
-        if piece != 0 and isinstance(piece, str):
-            piece_color = "white" if '-' not in piece else "black"
+        piece_color = "white" if isinstance(piece, str) and '-' not in piece else "black" if piece != 0 else None
         
         if piece != 0 and isinstance(piece, str) and piece_color == database.current_turn:
             self.piece_selected = piece
-            legal_moves = self._get_legal_moves_for_piece(piece)
-            self._clear_all_legal_move_indicators()
-            self._show_legal_moves(legal_moves)
+            self._refresh_all_images()
         else:
             if self.piece_selected and isinstance(self.piece_selected, str):
                 try:
@@ -1625,11 +1586,11 @@ class ChessGame:
                 except ValueError as e:
                     database.gamelogger.error(f"Piece not found: {e}")
                     self.piece_selected = None
-                    self._clear_all_legal_move_indicators()
+                    self._refresh_all_images()
                     return
             
             self.piece_selected = None
-            self._clear_all_legal_move_indicators()
+            self._refresh_all_images()
     
     def _execute_stockfish_move(self) -> None:
         """Execute Stockfish move"""

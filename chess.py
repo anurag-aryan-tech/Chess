@@ -85,7 +85,7 @@ class ChessGame:
         self.flipped = False
         self.settings_open = False
         self.game_mode: Optional[str] = None
-        self.disabled_color: Optional[str] = None
+        self.disabled_color: List[str] = [0, 0]
         self.stockfish_chance: bool = False
         self.last_from_square = None
         self.last_to_square = None
@@ -94,6 +94,8 @@ class ChessGame:
         self.visual_to: Optional[Tuple] = None
         self.selected_square: Optional[Tuple[int, int]] = None
         self.empty_image = ctk.CTkImage(Image.new("RGBA", (1, 1), (0, 0, 0, 0)), size=(1, 1))
+        self._dot_pil_base = Image.open("images/dot.png").convert("RGBA")
+        self.current_fen = 0
         
         # UI elements
         # OPTIMIZED: Using Tuple[int, int] keys to avoid constant string conversions
@@ -131,6 +133,7 @@ class ChessGame:
         self._create_close_button()
         self._create_footer_signature()
         self._add_close_button()
+        self._bind_arrow_keys()
         
         # Create chessboard (hidden initially)
         self._create_chessboard()
@@ -154,9 +157,14 @@ class ChessGame:
         root.bind("<s>", lambda _: self._show_settings_overlay())
         root.bind("<Escape>", lambda _: self._handle_escape())
         root.bind("<Configure>", lambda event: self._handle_window_resize(event))
-
         root.protocol("WM_DELETE_WINDOW", self._handle_close)
         return root
+    
+    def _bind_arrow_keys(self):
+        self.root.bind("<Left>", self._on_left_arrow_click)
+        self.root.bind("<Right>", self._on_right_arrow_click)
+        self.root.bind("<Control-Left>", lambda _: self._on_ctrl_arrow_click("left"))
+        self.root.bind("<Control-Right>", lambda _: self._on_ctrl_arrow_click("right"))
     
     def _setup_window(self, window: ctk.CTk) -> None:
         """Configure window properties"""
@@ -517,8 +525,6 @@ class ChessGame:
 
                 color, color2 = color2, color
             color, color2 = color2, color
-
-    # ==================== PIECE RENDERING ====================
     
     # ==================== PIECE RENDERING ====================
 
@@ -637,7 +643,7 @@ class ChessGame:
                 
             # 2. Add Dot if legal
             if is_legal:
-                dot_pil = Image.open("images/dot.png").convert("RGBA").resize((size, size), Image.Resampling.LANCZOS)
+                dot_pil = self._dot_pil_base.resize((size, size), Image.Resampling.LANCZOS)
                 if base_piece == "empty":
                     final_pil = dot_pil
                 else:
@@ -690,7 +696,8 @@ class ChessGame:
         legal_visual_squares = self._compute_legal_visual_squares(self.piece_selected)
         current_size = self._calculate_image_size()
         size_changed = current_size != self._last_image_size
-        self._warm_image_cache_for_size(current_size)
+        if current_size not in self._warmed_image_sizes:
+            self._warm_image_cache_for_size(current_size)
 
         if force or size_changed or not self._render_state:
             squares_to_refresh = set(self._all_visual_squares)
@@ -713,6 +720,60 @@ class ChessGame:
     def _reapply_highlights(self) -> None:
         """Compatibility wrapper for full highlight reapplication."""
         self._update_highlights_incremental(force=True)
+    
+    def _show_fen_board(self, fen: str) -> None:
+        """Display the FEN on the board"""
+        board = self.utils.notations.generate_matrix(fen)
+        if self.flipped:
+            board = np.flip(board, axis=(0, 1))
+        self.view_matrix = board
+        self._refresh_all_images(force=True)
+
+        self.disabled_color = ["black", "white"]
+    
+    def _reset_board_to_matrix(self) -> None:
+        """Display the database matrix on the board with flipped if required"""
+        self.view_matrix = database.matrix.copy()
+        if self.flipped:
+            self.view_matrix = np.flip(self.view_matrix, axis=(0, 1))
+        self._refresh_all_images(force=True)
+
+        if self.game_mode == "pass_n_play":
+            self.disabled_color = [0, 0]
+        else:
+            self.disabled_color = ["white" if self.vs_ai_configurations["color"] == "black" else "black", 0]
+        
+        self.current_fen = len(database.fen_history) - 1
+    
+    def _on_left_arrow_click(self, _=None) -> None:
+        """Handle left arrow click"""
+        if self.current_fen <= 0:
+            return
+        
+        self.current_fen -= 1
+        self._show_fen_board(database.fen_history[self.current_fen])
+    
+    def _on_right_arrow_click(self, _=None) -> None:
+        """Handle right arrow click"""
+        if self.current_fen >= len(database.fen_history) - 1:
+            return
+        
+        self.current_fen += 1
+        
+        if self.current_fen == len(database.fen_history) - 1:
+            self._reset_board_to_matrix()
+        else:
+            self._show_fen_board(database.fen_history[self.current_fen])
+    
+    def _on_ctrl_arrow_click(self, arrow: Literal["left", "right"]):
+        if arrow == "left":
+            if len(database.fen_history) <= 1:
+                return
+            self.current_fen = 0
+            self._show_fen_board(database.fen_history[0])
+        else:
+            self.current_fen = len(database.fen_history) - 1
+            self._reset_board_to_matrix()
 
     # ==================== START MENU ====================
     
@@ -1116,6 +1177,8 @@ class ChessGame:
         # Store in game history
         database.game_history.append(stockfish_notation)
         database.game_pgn.append(chess_notation)
+        database.fen_history.append(self.utils.notations.generate_fen(side_to_move=database.current_turn, fullmove_number=database.fullmove))
+        self.current_fen += 1
         self.review.evaluate_last_move_async()
         
         database.gamelogger.move(f"Move: {chess_notation}")
@@ -1366,8 +1429,10 @@ class ChessGame:
         self._current_legal_visual_squares.clear()
         self._highlighted_visual_squares.clear()
         self._render_state.clear()
-        self._square_color_state = {square: self._square_base_color(square) for square in self._all_visual_squares}
         self._last_image_size = 0
+        self.current_fen = len(database.fen_history) - 1
+        
+        self._refresh_board_colors()
         
         for label in self.promotion_labels.values():
             label.configure(image=None)
@@ -1402,6 +1467,10 @@ class ChessGame:
         if "p" in piece and to_square[0] in [0, 7]:
             # For promotion: switch turn first, then enter promotion UI
             promotion_color = "black" if "-" in piece else "white"
+            if self.game_mode == "vs_ai" and database.current_turn != self.vs_ai_configurations["color"]:
+                if base_piece is not None:
+                    self._end_promotion(base_piece)
+                    return True
             self._start_promotion(promotion_color, to_square, from_square, base_piece)
             return True
         
@@ -1437,7 +1506,8 @@ class ChessGame:
         else:
             current_size = self._calculate_image_size()
             size_changed = current_size != self._last_image_size
-            self._warm_image_cache_for_size(current_size)
+            if current_size not in self._warmed_image_sizes:
+                self._warm_image_cache_for_size(current_size)
 
             changed_logical_squares: Set[Tuple[int, int]] = {from_square, to_square}
 
@@ -1512,6 +1582,8 @@ class ChessGame:
             # Store in game history
             database.game_history.append(stockfish_notation)
             database.game_pgn.append(chess_notation)
+            database.fen_history.append(self.utils.notations.generate_fen(side_to_move=database.current_turn, fullmove_number=database.fullmove))
+            self.current_fen += 1
             self.review.evaluate_last_move_async()
             
             database.gamelogger.move(f"Move: {chess_notation}")
@@ -1555,9 +1627,9 @@ class ChessGame:
                 self._show_game_over_dialog("stalemate")
                 return "stalemate"
 
-    def _disable_color(self, color: Literal["white", "black"]):
+    def _disable_color(self, color: Literal["white", "black"], pos: int = 0):
         if not self.game_mode == "pass_n_play":
-            self.disabled_color = color
+            self.disabled_color[pos] = color
 
     # ==================== SETTINGS OVERLAY ====================
 
@@ -1717,7 +1789,7 @@ class ChessGame:
         self.root.bind("<Escape>", lambda _: self._handle_escape())
     
     def _handle_square_click(self, visual_square: Tuple[int, int]) -> None:
-        if self.promoting or self.disabled_color == database.current_turn:
+        if self.promoting or self.disabled_color is None or database.current_turn in self.disabled_color:
             return
         
         logical_square = self._visual_to_logical(visual_square)
@@ -1732,7 +1804,8 @@ class ChessGame:
             new_legal_visuals = self._compute_legal_visual_squares(self.piece_selected)
             current_size = self._calculate_image_size()
             size_changed = current_size != self._last_image_size
-            self._warm_image_cache_for_size(current_size)
+            if current_size not in self._warmed_image_sizes:
+                self._warm_image_cache_for_size(current_size)
 
             self._current_legal_visual_squares = new_legal_visuals
             if size_changed or not self._render_state:
@@ -1765,7 +1838,8 @@ class ChessGame:
 
             current_size = self._calculate_image_size()
             size_changed = current_size != self._last_image_size
-            self._warm_image_cache_for_size(current_size)
+            if current_size not in self._warmed_image_sizes:
+                self._warm_image_cache_for_size(current_size)
 
             if size_changed or not self._render_state:
                 self._refresh_squares(set(self._all_visual_squares), set(), current_size, force=True)
@@ -1786,6 +1860,8 @@ class ChessGame:
                 self._ai_executor.shutdown(wait=False, cancel_futures=True)
             except Exception:
                 pass
+            # Recreate executor so the next game can still submit AI tasks
+            self._ai_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="chess-ai")
 
     def _get_ai_color(self) -> Optional[str]:
         if not self.vs_ai_configurations:
@@ -1797,7 +1873,7 @@ class ChessGame:
             return
 
         if not self._ai_future.done():
-            self.root.after(25, lambda token=request_token: self._poll_ai_move_result(token))
+            self.root.after(10, lambda token=request_token: self._poll_ai_move_result(token))
             return
 
         future = self._ai_future
@@ -1817,7 +1893,8 @@ class ChessGame:
             return
 
         database.gamelogger.move(f"Stockfish plays: {move}")
-        delay = random.randint(150, 350)
+        elo = self.utils.ai.current_config.elo if self.utils.ai.current_config else 0
+        delay = 50 if elo > 2000 else random.randint(250, 500)
         self.root.after(delay, lambda mv=move, token=request_token: self._apply_ai_move(mv, token))
 
     def _apply_ai_move(self, move: str, request_token: int) -> None:
@@ -1835,7 +1912,9 @@ class ChessGame:
         from_square = self.utils.coords.chess_to_matrix(from_sq)
         to_square = self.utils.coords.chess_to_matrix(to_sq)
         promotion = base.lower() if base else None
-        self.root.after(500, lambda from_square=from_square, to_square=to_square, promotion=promotion: self._execute_move(from_square, to_square, promotion))
+        
+        # Delay already applied in _poll_ai_move_result; execute immediately here
+        self._execute_move(from_square, to_square, promotion)
 
     def _execute_stockfish_move(self) -> None:
         """Queue asynchronous Stockfish move fetch without blocking UI thread."""

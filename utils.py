@@ -151,6 +151,37 @@ class NotationGenerator:
         
         return f"{board_fen} {side_to_move} {castling} {en_passant} {halfmove_clock} {fullmove_number}"
     
+    @staticmethod
+    def generate_matrix(fen: str) -> np.ndarray:
+        """
+        Generate matrix from FEN string.
+        
+        Args:
+            fen: FEN string
+            
+        Returns:
+            8x8 numpy array
+        """
+        board = np.zeros((8, 8), dtype=object)
+        fen_parts = fen.split(" ")
+        board_fen = fen_parts[0]
+        
+        fen_rows = board_fen.split("/")
+        for row_idx, fen_row in enumerate(fen_rows):
+            col_idx = 0
+            for char in fen_row:
+                if char.isdigit():
+                    col_idx += int(char)
+                else:
+                    if char == char.lower():
+                        char = "-" + char.lower()
+                    else:
+                        char = char.lower()
+                    board[row_idx, col_idx] = char + "1"
+                    col_idx += 1
+        
+        return board
+    
     def chess_notation(self, piece: str, to_square: Tuple[int, int], promotion: Optional[str] = None, check: bool = False, checkmate: bool = False, castle: bool = False, capture: bool = False, from_square: Optional[Tuple[int, int]] = None, disambiguation: str = "") -> str:
         """
         Generate standard chess notation for a move.
@@ -1200,7 +1231,7 @@ ELO_CONFIGS = {
     ),
     1800: StockfishConfig(
         elo=1800,
-        skill_level=7,
+        skill_level=4,
         depth=15,
         multi_pv=2,
         blunder_chance=0.005,  # 0.5% chance of blunder
@@ -1208,8 +1239,8 @@ ELO_CONFIGS = {
     ),
     2000: StockfishConfig(
         elo=2000,
-        skill_level=10,
-        depth=18,
+        skill_level=14,
+        depth=8,
         multi_pv=2,
         blunder_chance=0.0,
         move_weights=[95, 5]
@@ -1217,7 +1248,7 @@ ELO_CONFIGS = {
     2200: StockfishConfig(
         elo=2200,
         skill_level=12,
-        depth=20,
+        depth=8,
         multi_pv=1,
         blunder_chance=0.0,
         move_weights=[100]
@@ -1225,7 +1256,7 @@ ELO_CONFIGS = {
     2400: StockfishConfig(
         elo=2400,
         skill_level=15,
-        depth=22,
+        depth=9,
         multi_pv=1,
         blunder_chance=0.0,
         move_weights=[100]
@@ -1233,7 +1264,7 @@ ELO_CONFIGS = {
     2600: StockfishConfig(
         elo=2600,
         skill_level=18,
-        depth=25,
+        depth=9,
         multi_pv=1,
         blunder_chance=0.0,
         move_weights=[100]
@@ -1241,7 +1272,7 @@ ELO_CONFIGS = {
     2800: StockfishConfig(
         elo=2800,
         skill_level=20,
-        depth=28,
+        depth=10,
         multi_pv=1,
         blunder_chance=0.0,
         move_weights=[100]
@@ -1249,7 +1280,7 @@ ELO_CONFIGS = {
     3000: StockfishConfig(
         elo=3000,
         skill_level=20,
-        depth=30,
+        depth=11,
         multi_pv=1,
         blunder_chance=0.0,
         move_weights=[100]
@@ -1710,5 +1741,4 @@ class Utilities:
 
 if __name__ == "__main__":
     utils = Utilities()
-    fen = utils.create_fen()
-    print(f"Starting FEN: {fen}")
+    print(utils.notations.generate_matrix("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"))

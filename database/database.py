@@ -491,7 +491,7 @@ class Database:
         self.game_history: List[str] = []
         self.stockfish_move_time: Optional[int] = None
         self.game_pgn: List[str] = []
-        self.last_synced_fen: Optional[str] = None
+        self.fen_history: List[str] = ["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"]
 
         # Evaluation
         self.evaluation_history: List[Dict[str, int|str|float]] = []
@@ -595,6 +595,7 @@ class Database:
         # Reset Game History
         self.game_history = []
         self.game_pgn = []
+        self.fen_history = ["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"]
 
         # Reset evaluation history
         self.evaluation_history: List[Dict[str, int|str|float]] = []

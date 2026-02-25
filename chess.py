@@ -727,15 +727,30 @@ class ChessGame:
         if self.flipped:
             board = np.flip(board, axis=(0, 1))
         self.view_matrix = board
+
+        # Clear move highlights while viewing history
+        self.last_from_square = None
+        self.last_to_square = None
+
         self._refresh_all_images(force=True)
 
         self.disabled_color = ["black", "white"]
     
     def _reset_board_to_matrix(self) -> None:
         """Display the database matrix on the board with flipped if required"""
-        self.view_matrix = database.matrix.copy()
+        # Use a reference/view instead of .copy() so that subsequent moves
+        # to database.matrix are reflected in self.view_matrix automatically.
         if self.flipped:
-            self.view_matrix = np.flip(self.view_matrix, axis=(0, 1))
+            self.view_matrix = np.flip(database.matrix, axis=(0, 1))
+        else:
+            self.view_matrix = database.matrix
+
+        # Restore last-move highlights from game history
+        if database.game_history:
+            last_uci = database.game_history[-1]
+            self.last_from_square = self.utils.coords.chess_to_matrix(last_uci[:2])
+            self.last_to_square = self.utils.coords.chess_to_matrix(last_uci[2:4])
+
         self._refresh_all_images(force=True)
 
         if self.game_mode == "pass_n_play":
@@ -747,6 +762,8 @@ class ChessGame:
     
     def _on_left_arrow_click(self, _=None) -> None:
         """Handle left arrow click"""
+        if self.game_mode is None:
+            return
         if self.current_fen <= 0:
             return
         
@@ -755,6 +772,8 @@ class ChessGame:
     
     def _on_right_arrow_click(self, _=None) -> None:
         """Handle right arrow click"""
+        if self.game_mode is None:
+            return
         if self.current_fen >= len(database.fen_history) - 1:
             return
         
@@ -766,6 +785,8 @@ class ChessGame:
             self._show_fen_board(database.fen_history[self.current_fen])
     
     def _on_ctrl_arrow_click(self, arrow: Literal["left", "right"]):
+        if self.game_mode is None:
+            return
         if arrow == "left":
             if len(database.fen_history) <= 1:
                 return
@@ -1178,7 +1199,7 @@ class ChessGame:
         database.game_history.append(stockfish_notation)
         database.game_pgn.append(chess_notation)
         database.fen_history.append(self.utils.notations.generate_fen(side_to_move=database.current_turn, fullmove_number=database.fullmove))
-        self.current_fen += 1
+        self.current_fen = len(database.fen_history) - 1
         self.review.evaluate_last_move_async()
         
         database.gamelogger.move(f"Move: {chess_notation}")
@@ -1445,6 +1466,13 @@ class ChessGame:
 
     def _execute_move(self, from_square: Tuple[int, int], to_square: Tuple[int, int], base_piece: Optional[str] = None) -> bool:
         """Execute a piece move on the board - delegates to centralized state manager"""
+        # Snap view_matrix back to live board if viewing history
+        if self.flipped:
+            self.view_matrix = np.flip(database.matrix, axis=(0, 1))
+        else:
+            self.view_matrix = database.matrix
+        self.current_fen = len(database.fen_history) - 1
+
         piece = database.matrix[from_square[0], from_square[1]]
         
         if piece == 0 or not isinstance(piece, str):
@@ -1790,6 +1818,9 @@ class ChessGame:
     
     def _handle_square_click(self, visual_square: Tuple[int, int]) -> None:
         if self.promoting or self.disabled_color is None or database.current_turn in self.disabled_color:
+            return
+        # Block clicks while viewing history
+        if self.current_fen != len(database.fen_history) - 1:
             return
         
         logical_square = self._visual_to_logical(visual_square)

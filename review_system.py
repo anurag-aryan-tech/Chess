@@ -207,34 +207,46 @@ class OpeningBook:
         "b1a3": "Sodium Attack",
     }
     
-    @staticmethod
-    def get_opening_from_api(fen: str, play: str = "") -> Optional[str]:
+    _api_cache: Dict[str, Optional[str]] = {}
+    
+    @classmethod
+    def get_opening_from_api(cls, fen: str, play: str = "") -> Tuple[bool, Optional[str]]:
         """
         Query Lichess API for opening name.
+        Uses in-memory caching to avoid duplicate requests.
         
         Args:
             fen: Position in FEN format
-            play: Moves from starting position (optional)
+            play: Moves from starting position (comma-separated, e.g., 'e2e4,e7e5')
             
         Returns:
-            Opening name or None if not found/error
+            (success, opening_name): 
+                success is True if API responded properly (even if no opening found)
+                opening_name is the name if found, None otherwise
         """
+        cache_key = play if play else fen
+        if cache_key in cls._api_cache:
+            return True, cls._api_cache[cache_key]
+
         try:
+            # Prefer 'play' parameter for more reliable opening detection
+            params = {"play": play} if play else {"fen": fen}
             response = requests.get(
                 LICHESS_API_URL,
-                params={"fen": fen, "play": play},
+                params=params,
                 timeout=LICHESS_API_TIMEOUT
             )
             
             if response.status_code == 200:
                 data = response.json()
                 opening = data.get("opening")
-                if isinstance(opening, dict):
-                    return opening.get("name")
-            return None
+                opening_name = opening.get("name") if isinstance(opening, dict) else None
+                cls._api_cache[cache_key] = opening_name
+                return True, opening_name
+            return False, None
         except Exception as e:
-            # Silently fail - don't spam logs with API errors
-            return None
+            # Network error or timeout (silently fail)
+            return False, None
     
     @classmethod
     def get_first_move_name(cls, move: str) -> str:
@@ -1187,9 +1199,10 @@ class ReviewSystem:
         self._last_enqueued_move_count: int = 0
         self._last_post_game_summary_key: Optional[Tuple[int, str]] = None
         
-        # Sync tracking
         self._synced_history_len: int = 0
+        self._synced_history: List[str] = []
         self._opening_active: bool = True
+        self._api_failure_count: int = 0
         
         # Utility components
         self.notation_gen = NotationGenerator()
@@ -1214,6 +1227,7 @@ class ReviewSystem:
             self._last_post_game_summary_key = None
         
         self._opening_active = True
+        self._api_failure_count = 0
     
     # ==================== STOCKFISH MANAGEMENT ====================
     
@@ -1272,15 +1286,31 @@ class ReviewSystem:
         """Reset Stockfish to starting position"""
         self.stockfish.set_fen_position(STARTING_FEN)
         self._synced_history_len = 0
+        self._synced_history = []
 
     def _sync_review_engine_to_snapshot(self, history: List[str]) -> None:
-        """Synchronize Stockfish to a provided move-history snapshot."""
-        self._reset_review_engine()
-        
-        if history:
-            self.stockfish.make_moves_from_current_position(history)
-        
-        self._synced_history_len = len(history)
+        """Synchronize Stockfish to a provided move-history snapshot.
+        Uses incremental sync when current state is a prefix of the target."""
+        target_len = len(history)
+
+        # Check if current engine state is a prefix of the target history
+        if (
+            self._synced_history_len > 0
+            and self._synced_history_len <= target_len
+            and self._synced_history == history[:self._synced_history_len]
+        ):
+            # Incremental: only replay the new moves
+            remaining = history[self._synced_history_len:]
+            if remaining:
+                self.stockfish.make_moves_from_current_position(remaining)
+        else:
+            # Full reset required (diverged history)
+            self._reset_review_engine()
+            if history:
+                self.stockfish.make_moves_from_current_position(history)
+
+        self._synced_history_len = target_len
+        self._synced_history = list(history)
     
     def _sync_review_engine_to_history(self) -> None:
         """
@@ -1473,16 +1503,15 @@ class ReviewSystem:
         """
         Evaluate a single queued request snapshot.
         
-        This guarantees deterministic per-move review even if game state has advanced.
+        Optimized evaluation order:
+        1. Sync to before-move position, get eval + top_moves + board
+        2. Incrementally sync one move forward for after-move eval
+        This reduces engine resets from 3 to 2 (with the second being incremental).
         """
         with self._lock:
             if request.session_id != self._session_id:
                 self._log_queue(f"Review stale skip: move {request.move_count}, session {request.session_id}")
                 return
-        
-        # Sync Stockfish to request position and get current eval.
-        self._sync_review_engine_to_snapshot(request.history)
-        cp, mate = self._get_current_evaluation()
         
         # Determine who moved.
         color = "white" if request.current_turn == "black" else "black"
@@ -1498,6 +1527,23 @@ class ReviewSystem:
             side_to_move=request.current_turn[0],  # type: ignore[index]
             fullmove_number=request.fullmove
         )
+        
+        # ---- Step 1: Sync to BEFORE-move position ----
+        before_history = request.history[:-1] if request.history else []
+        self._sync_review_engine_to_snapshot(before_history)
+        cp_before, mate_before = self._get_current_evaluation()
+        
+        # Save FEN for efficient later use in upgrade checks (cheap call)
+        fen_before = None
+        if not (request.last_forced or request.is_checkmate_after_move):
+            try:
+                fen_before = self.stockfish.get_fen_position()
+            except Exception:
+                pass
+        
+        # ---- Step 2: Incrementally sync to AFTER-move position (just 1 move) ----
+        self._sync_review_engine_to_snapshot(request.history)
+        cp, mate = self._get_current_evaluation()
         
         # ===== CLASSIFICATION PRIORITY =====
         
@@ -1517,7 +1563,7 @@ class ReviewSystem:
             return
         
         # Priority 2: BOOK (opening theory)
-        book_result = self._check_book_move(move_count, last_move, last_pgn, color, fen, cp, mate)
+        book_result = self._check_book_move(move_count, last_move, last_pgn, color, fen, cp, mate, request.history)
         if book_result:
             if not self._is_request_session_active(request):
                 return
@@ -1543,6 +1589,7 @@ class ReviewSystem:
             return
         
         # Priority 4 & 5: EVALUATION-BASED + SPECIAL UPGRADES
+        # Pass pre-computed before-position eval and fen_before for lazy upgrade checks
         self._evaluate_with_engine(
             color=color,
             cp=cp,
@@ -1554,7 +1601,10 @@ class ReviewSystem:
             pgn_snapshot=request.pgn,
             matrix_snapshot=request.matrix_snapshot,
             force_append=True,
-            request_session_id=request.session_id
+            request_session_id=request.session_id,
+            cp_before=cp_before,
+            mate_before=mate_before,
+            fen_before=fen_before
         )
     
     def _check_book_move(
@@ -1565,7 +1615,8 @@ class ReviewSystem:
         color: str,
         fen: str,
         cp,
-        mate
+        mate,
+        history: List[str]
     ) -> Optional[Dict]:
         """
         Check if move is in opening book.
@@ -1576,11 +1627,13 @@ class ReviewSystem:
         # Once opening is broken, never return to book in this game.
         if not self._opening_active:
             return None
+            
+        play_string = ",".join(history)
         
         # First move is always book (with fallback name)
         if move_count == 1:
             self._opening_active = True
-            opening = self.opening_book.get_opening_from_api(fen)
+            success, opening = self.opening_book.get_opening_from_api(fen, play=play_string)
             if not opening:
                 opening = self.opening_book.get_first_move_name(last_move)
             
@@ -1596,22 +1649,43 @@ class ReviewSystem:
             return eval_data.to_dict()
         
         # API-only policy after move 1.
-        opening = self.opening_book.get_opening_from_api(fen)
-        if opening:
+        success, opening = self.opening_book.get_opening_from_api(fen, play=play_string)
+        
+        if success:
+            # API responded successfully
+            if opening:
+                eval_data = EvaluationData(
+                    color=color,
+                    cp=cp,
+                    mate=mate,
+                    move_type="book",
+                    accuracy="",
+                    opening=opening,
+                    book_source="api"
+                )
+                return eval_data.to_dict()
+            else:
+                # API responded, but genuinely out of book. Close opening phase permanently.
+                self._opening_active = False
+                return None
+        else:
+            # API failed (timeout/network). Don't close book permanently yet.
+            self._api_failure_count += 1
+            if self._api_failure_count >= 3:
+                self._opening_active = False
+            
+            # Since we don't know if it's a book move, return a fallback "book" to avoid
+            # misclassifying an opening move as "best" or "blunder".
             eval_data = EvaluationData(
                 color=color,
                 cp=cp,
                 mate=mate,
                 move_type="book",
                 accuracy="",
-                opening=opening,
-                book_source="api"
+                opening="Opening Move",
+                book_source="fallback"
             )
             return eval_data.to_dict()
-        
-        self._opening_active = False
-        
-        return None
     
     def _evaluate_with_engine(
         self,
@@ -1625,12 +1699,16 @@ class ReviewSystem:
         pgn_snapshot: Optional[List[str]] = None,
         matrix_snapshot: Optional[List[List[Any]]] = None,
         force_append: bool = False,
-        request_session_id: Optional[int] = None
+        request_session_id: Optional[int] = None,
+        cp_before=None,
+        mate_before=None,
+        fen_before: Optional[str] = None
     ) -> None:
         """
         Evaluate move using engine comparison.
         
         Calculates EP loss, base classification, and checks for upgrades.
+        Accepts optional pre-computed before-position data to avoid redundant engine syncs.
         """
         if history_snapshot is None:
             history_snapshot = list(database.game_history)
@@ -1641,8 +1719,9 @@ class ReviewSystem:
         if move_count is None:
             move_count = len(history_snapshot)
         
-        # Previous and current evals from explicit history snapshots (not evaluation_history).
-        cp_before, mate_before = self._get_evaluation_for_history(history_snapshot[:-1])
+        # Use pre-computed before-eval or compute it (fallback for direct calls)
+        if cp_before is None and mate_before is None:
+            cp_before, mate_before = self._get_evaluation_for_history(history_snapshot[:-1])
         cp_after = cp
         mate_after = mate
         
@@ -1680,7 +1759,8 @@ class ReviewSystem:
                 mate_before=mate_before,
                 history_snapshot=history_snapshot,
                 pgn_snapshot=pgn_snapshot,
-                after_matrix_snapshot=matrix_snapshot
+                after_matrix_snapshot=matrix_snapshot,
+                fen_before=fen_before
             )
         
         # Store result
@@ -1713,25 +1793,31 @@ class ReviewSystem:
         mate_before,
         history_snapshot: List[str],
         pgn_snapshot: List[str],
-        after_matrix_snapshot: List[List[Any]]
+        after_matrix_snapshot: List[List[Any]],
+        fen_before: Optional[str] = None
     ) -> str:
         """
         Check if move should be upgraded to Brilliant or Great.
         
-        Args:
-            base_type: Current classification
-            ep_loss: Expected points loss
-            last_move: UCI move
-            last_pgn: Chess notation
-            color: Player color
-            cp_before: CP before move
-            mate_before: Mate before move
-            
+        Uses fen_before for efficient position reset (no full replay needed).
+        Only called for upgrade-worthy moves (best/excellent).
+        
         Returns:
             Upgraded classification or base_type
         """
-        # Rebuild board state before move for the exact request history.
-        before_board, top_moves = self._rebuild_before_position_data(history_snapshot)
+        # Get before-position data: use fen_before for efficient reset if available
+        if fen_before:
+            try:
+                self.stockfish.set_fen_position(fen_before)
+                self._synced_history_len = 0
+                self._synced_history = []
+                top_moves = self.stockfish.get_top_moves(3) or []
+                before_board = self.board_analyzer._board_from_fen(fen_before)
+            except Exception as e:
+                database.gamelogger.error(f"Failed to get upgrade data via FEN: {e}")
+                return base_type
+        else:
+            before_board, top_moves = self._rebuild_before_position_data(history_snapshot)
         
         if not before_board or not top_moves:
             return base_type

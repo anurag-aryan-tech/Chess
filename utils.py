@@ -1320,13 +1320,23 @@ class AIUtilities:
         """
         Initialize and load the Stockfish chess engine.
         """
-        path = "stockfish/stockfish-windows-x86-64-avx2.exe"
-        if os.path.exists(path):
-            stockfish = Stockfish(self.resource_path(path))
-            database.stockfish = stockfish
-            database.gamelogger.ai("Stockfish Added" if stockfish else "Failed to add Stockfish")
+        import os
+        if os.name == 'posix':
+            path = "/usr/games/stockfish"
+            if os.path.exists(path):
+                stockfish = Stockfish(path)
+                database.stockfish = stockfish
+                database.gamelogger.ai("Stockfish Added" if stockfish else "Failed to add Stockfish")
+            else:
+                database.gamelogger.error("Stockfish not found!")
         else:
-            database.gamelogger.error("Stockfish not found!")
+            path = "stockfish/stockfish-windows-x86-64-avx2.exe"
+            if os.path.exists(path):
+                stockfish = Stockfish(self.resource_path(path))
+                database.stockfish = stockfish
+                database.gamelogger.ai("Stockfish Added" if stockfish else "Failed to add Stockfish")
+            else:
+                database.gamelogger.error("Stockfish not found!")
     
     def configure_strength(self, elo: int) -> None:
         """

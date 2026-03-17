@@ -38,6 +38,7 @@ from collections import deque
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, Future
 from threading import Lock
+import threading
 from stockfish import Stockfish
 from typing import Optional, Dict, List, Tuple, Literal, Deque, Any
 from dataclasses import dataclass
@@ -1183,24 +1184,27 @@ class ReviewSystem:
     
     def __init__(self):
         """Initialize review system with all components"""
-        # Stockfish engine
-        self.stockfish = self._initialize_stockfish()
-        self._eval_perspective = self._detect_eval_perspective()
+        # Engine thread-local storage for 2 workers
+        self._local_data = threading.local()
+        
+        # Initialize a main thread stockfish to detect perspective
+        main_stockfish = self._initialize_stockfish()
+        self._eval_perspective = self._detect_eval_perspective(main_stockfish)
         
         # Current evaluation storage
         self.curr_eval: Dict[str, int | str | float] = {}
         
         # Threading for async evaluation
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="review-eval")
+        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="review-eval")
         self._lock = Lock()
-        self._pending_future: Optional[Future] = None
+        self._pending_futures: List[Future] = []
+        self._active_workers: int = 0
         self._request_queue: Deque[ReviewRequest] = deque()
         self._session_id: int = 0
         self._last_enqueued_move_count: int = 0
         self._last_post_game_summary_key: Optional[Tuple[int, str]] = None
+        self._eval_cache: Dict[str, Tuple[int | float | str, int | float | str, str]] = {}
         
-        self._synced_history_len: int = 0
-        self._synced_history: List[str] = []
         self._opening_active: bool = True
         self._api_failure_count: int = 0
         
@@ -1225,6 +1229,7 @@ class ReviewSystem:
             self._request_queue.clear()
             self._last_enqueued_move_count = 0
             self._last_post_game_summary_key = None
+            self._eval_cache.clear()
         
         self._opening_active = True
         self._api_failure_count = 0
@@ -1233,8 +1238,12 @@ class ReviewSystem:
     
     def _initialize_stockfish(self) -> Stockfish:
         """Initialize Stockfish engine"""
+        import os
         ai = AIUtilities()
-        path = ai.resource_path("stockfish/stockfish-windows-x86-64-avx2.exe")
+        if os.name == 'posix':
+            path = "/usr/games/stockfish"
+        else:
+            path = ai.resource_path("stockfish/stockfish-windows-x86-64-avx2.exe")
         engine = Stockfish(path)
         
         try:
@@ -1249,7 +1258,34 @@ class ReviewSystem:
         
         return engine
     
-    def _detect_eval_perspective(self) -> str:
+    @property
+    def stockfish(self) -> Stockfish:
+        """Get thread-local stockfish instance"""
+        if not hasattr(self._local_data, 'stockfish'):
+            self._local_data.stockfish = self._initialize_stockfish()
+            self._local_data.synced_history_len = 0
+            self._local_data.synced_history = []
+        return self._local_data.stockfish
+        
+    @property
+    def _synced_history_len(self) -> int:
+        return getattr(self._local_data, 'synced_history_len', 0)
+        
+    @_synced_history_len.setter
+    def _synced_history_len(self, value: int):
+        self._local_data.synced_history_len = value
+        
+    @property
+    def _synced_history(self) -> List[str]:
+        if not hasattr(self._local_data, 'synced_history'):
+            self._local_data.synced_history = []
+        return self._local_data.synced_history
+        
+    @_synced_history.setter
+    def _synced_history(self, value: List[str]):
+        self._local_data.synced_history = value
+
+    def _detect_eval_perspective(self, engine: Stockfish) -> str:
         """
         Detect evaluation perspective for this Stockfish wrapper.
         
@@ -1262,10 +1298,10 @@ class ReviewSystem:
         fen_black_to_move = "rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1"
         
         try:
-            self.stockfish.set_fen_position(fen_white_to_move)
-            eval_white = self.stockfish.get_evaluation()
-            self.stockfish.set_fen_position(fen_black_to_move)
-            eval_black = self.stockfish.get_evaluation()
+            engine.set_fen_position(fen_white_to_move)
+            eval_white = engine.get_evaluation()
+            engine.set_fen_position(fen_black_to_move)
+            eval_black = engine.get_evaluation()
             
             cp_white = eval_white.get("value") if eval_white.get("type") == "cp" else None
             cp_black = eval_black.get("value") if eval_black.get("type") == "cp" else None
@@ -1378,7 +1414,7 @@ class ReviewSystem:
         Log per-color accuracy/type summary once game is over and reviews are complete.
         """
         with self._lock:
-            queue_idle = not self._request_queue
+            queue_idle = not self._request_queue and self._active_workers == 0
         
         if not queue_idle:
             return
@@ -1456,14 +1492,7 @@ class ReviewSystem:
         self._reset_review_engine()
         self._opening_active = True
         
-        evaluation = self.stockfish.get_evaluation()
-        
-        if evaluation["type"] == "cp":
-            cp = evaluation["value"]
-            mate = ""
-        else:
-            cp = ""
-            mate = evaluation["value"]
+        cp, mate, _ = self._get_current_evaluation([])
         
         eval_data = EvaluationData(
             color="white",
@@ -1530,20 +1559,14 @@ class ReviewSystem:
         
         # ---- Step 1: Sync to BEFORE-move position ----
         before_history = request.history[:-1] if request.history else []
-        self._sync_review_engine_to_snapshot(before_history)
-        cp_before, mate_before = self._get_current_evaluation()
+        cp_before, mate_before, fen_before = self._get_current_evaluation(before_history)
         
-        # Save FEN for efficient later use in upgrade checks (cheap call)
-        fen_before = None
-        if not (request.last_forced or request.is_checkmate_after_move):
-            try:
-                fen_before = self.stockfish.get_fen_position()
-            except Exception:
-                pass
+        # Avoid storing FEN for upgrades if it's forced/checkmate anyway
+        if request.last_forced or request.is_checkmate_after_move:
+            fen_before = None
         
         # ---- Step 2: Incrementally sync to AFTER-move position (just 1 move) ----
-        self._sync_review_engine_to_snapshot(request.history)
-        cp, mate = self._get_current_evaluation()
+        cp, mate, _ = self._get_current_evaluation(request.history)
         
         # ===== CLASSIFICATION PRIORITY =====
         
@@ -1934,16 +1957,25 @@ class ReviewSystem:
         Returns:
             (cp, mate) tuple
         """
-        self._sync_review_engine_to_snapshot(history_snapshot)
-        return self._get_current_evaluation()
+        cp, mate, _ = self._get_current_evaluation(history_snapshot)
+        return cp, mate
     
-    def _get_current_evaluation(self) -> Tuple[int | float | str, int | float | str]:
+    def _get_current_evaluation(self, history: List[str]) -> Tuple[int | float | str, int | float | str, str]:
         """
-        Get current position evaluation from Stockfish.
+        Get current position evaluation from Stockfish, utilizing the cache.
         
         Returns:
-            (cp, mate) tuple
+            (cp, mate, fen) tuple
         """
+        cache_key = ",".join(history)
+        
+        # Check cache first
+        with self._lock:
+            if cache_key in self._eval_cache:
+                return self._eval_cache[cache_key]
+        
+        # Not in cache, compute it
+        self._sync_review_engine_to_snapshot(history)
         evaluation = self.stockfish.get_evaluation()
         
         if evaluation["type"] == "cp":
@@ -1952,8 +1984,19 @@ class ReviewSystem:
         else:
             cp = ""
             mate = evaluation["value"]
+            
+        try:
+            fen = self.stockfish.get_fen_position()
+        except Exception:
+            fen = ""
+            
+        result = (cp, mate, fen)
         
-        return cp, mate
+        # Save to cache
+        with self._lock:
+            self._eval_cache[cache_key] = result
+            
+        return result
     
     def _parse_uci_move(self, move: str) -> Optional[Tuple[Tuple[int, int], Tuple[int, int], str]]:
         """Parse UCI move to from/to squares and promotion"""
@@ -2080,46 +2123,57 @@ class ReviewSystem:
             self._last_enqueued_move_count = request.move_count
             self._log_queue(f"Review enqueue: move {request.move_count}, session {request.session_id}")
             
-            # Start worker if not already running
-            if self._pending_future is None or self._pending_future.done():
-                self._pending_future = self._executor.submit(self._drain_evaluation_queue)
-    
+            # Start worker if not already running. We have max_workers=2.
+            while len(self._pending_futures) < 2 and self._request_queue:
+                future = self._executor.submit(self._drain_evaluation_queue)
+                self._pending_futures.append(future)
+                
+            # Clean up done futures
+            self._pending_futures = [f for f in self._pending_futures if not f.done()]
+
     def _drain_evaluation_queue(self) -> None:
         """
         Worker thread that drains evaluation queue.
         
         Continues evaluating while requests are pending.
         """
-        while True:
+        with self._lock:
+            self._active_workers += 1
+
+        try:
+            while True:
+                request: Optional[ReviewRequest] = None
+                with self._lock:
+                    if not self._request_queue:
+                        break
+                    else:
+                        request = self._request_queue.popleft()
+                
+                if request is None:
+                    # Defensive guard for static analyzers; runtime should not reach here.
+                    continue
+                
+                self._log_queue(f"Review dequeue: move {request.move_count}, session {request.session_id}")
+                
+                with self._lock:
+                    if request.session_id != self._session_id:
+                        self._log_queue(
+                            f"Review stale skip in drain: move {request.move_count}, "
+                            f"session {request.session_id} != {self._session_id}"
+                        )
+                        continue
+                
+                # Evaluate outside lock
+                self._evaluate_guarded(request)
+        finally:
             should_log_summary = False
-            request: Optional[ReviewRequest] = None
             with self._lock:
-                if not self._request_queue:
-                    self._pending_future = None
+                self._active_workers -= 1
+                if self._active_workers == 0 and not self._request_queue:
                     should_log_summary = True
-                else:
-                    request = self._request_queue.popleft()
             
             if should_log_summary:
                 self.log_post_game_summary_if_ready()
-                return
-            
-            if request is None:
-                # Defensive guard for static analyzers; runtime should not reach here.
-                continue
-            
-            self._log_queue(f"Review dequeue: move {request.move_count}, session {request.session_id}")
-            
-            with self._lock:
-                if request.session_id != self._session_id:
-                    self._log_queue(
-                        f"Review stale skip in drain: move {request.move_count}, "
-                        f"session {request.session_id} != {self._session_id}"
-                    )
-                    continue
-            
-            # Evaluate outside lock
-            self._evaluate_guarded(request)
     
     def _evaluate_guarded(self, request: Optional[ReviewRequest] = None) -> None:
         """

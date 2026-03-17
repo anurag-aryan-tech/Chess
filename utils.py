@@ -1264,7 +1264,7 @@ ELO_CONFIGS = {
     2600: StockfishConfig(
         elo=2600,
         skill_level=18,
-        depth=9,
+        depth=10,
         multi_pv=1,
         blunder_chance=0.0,
         move_weights=[100]
@@ -1272,7 +1272,7 @@ ELO_CONFIGS = {
     2800: StockfishConfig(
         elo=2800,
         skill_level=20,
-        depth=10,
+        depth=11,
         multi_pv=1,
         blunder_chance=0.0,
         move_weights=[100]
@@ -1280,7 +1280,7 @@ ELO_CONFIGS = {
     3000: StockfishConfig(
         elo=3000,
         skill_level=20,
-        depth=11,
+        depth=15,
         multi_pv=1,
         blunder_chance=0.0,
         move_weights=[100]

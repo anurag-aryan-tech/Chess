@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, Future
 from tkinter import messagebox
 import customtkinter as ctk
 import numpy as np
-from typing import Tuple, Dict, Optional, Literal, Any, Set
+from typing import Tuple, Dict, Optional, Literal, Any, Set, List
 from dataclasses import dataclass
 from utils import Utilities
 from database.database import database, MoveResult
@@ -85,7 +85,7 @@ class ChessGame:
         self.flipped = False
         self.settings_open = False
         self.game_mode: Optional[str] = None
-        self.disabled_color: List[str] = [0, 0]
+        self.disabled_color: List = [0, 0]
         self.stockfish_chance: bool = False
         self.last_from_square = None
         self.last_to_square = None
@@ -756,7 +756,7 @@ class ChessGame:
         if self.game_mode == "pass_n_play":
             self.disabled_color = [0, 0]
         else:
-            self.disabled_color = ["white" if self.vs_ai_configurations["color"] == "black" else "black", 0]
+            self.disabled_color = ["white" if self.vs_ai_configurations["color"] == "black" else "black", 0] #type: ignore
         
         self.current_fen = len(database.fen_history) - 1
     
@@ -1129,11 +1129,6 @@ class ChessGame:
             database.white_last_pawn = None
             database.white_pieces = database.white_pieces[database.white_pieces != piece]
         
-        # Set promotion state
-        self.promoting = True
-        self.promoting_square = target_square
-        self.promotion_from_square = from_square
-        
         # If promotion choice is known (e.g., from AI), proceed directly
         if not self.stockfish_chance or base is None:
             self._setup_promotion_images(color)
@@ -1198,7 +1193,7 @@ class ChessGame:
         # Store in game history
         database.game_history.append(stockfish_notation)
         database.game_pgn.append(chess_notation)
-        database.fen_history.append(self.utils.notations.generate_fen(side_to_move=database.current_turn, fullmove_number=database.fullmove))
+        database.fen_history.append(self.utils.notations.generate_fen(side_to_move=database.current_turn[0], fullmove_number=database.fullmove)) #type: ignore
         self.current_fen = len(database.fen_history) - 1
         self.review.evaluate_last_move_async()
         
@@ -1495,7 +1490,13 @@ class ChessGame:
         if "p" in piece and to_square[0] in [0, 7]:
             # For promotion: switch turn first, then enter promotion UI
             promotion_color = "black" if "-" in piece else "white"
-            if self.game_mode == "vs_ai" and database.current_turn != self.vs_ai_configurations["color"]:
+
+            # Set promotion state
+            self.promoting = True
+            self.promoting_square = to_square
+            self.promotion_from_square = from_square
+
+            if self.game_mode == "vs_ai" and database.current_turn != self.vs_ai_configurations["color"]: #type: ignore
                 if base_piece is not None:
                     self._end_promotion(base_piece)
                     return True
@@ -1610,7 +1611,7 @@ class ChessGame:
             # Store in game history
             database.game_history.append(stockfish_notation)
             database.game_pgn.append(chess_notation)
-            database.fen_history.append(self.utils.notations.generate_fen(side_to_move=database.current_turn, fullmove_number=database.fullmove))
+            database.fen_history.append(self.utils.notations.generate_fen(side_to_move=database.current_turn[0], fullmove_number=database.fullmove)) #type: ignore
             self.current_fen += 1
             self.review.evaluate_last_move_async()
             

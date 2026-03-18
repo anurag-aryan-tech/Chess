@@ -102,7 +102,7 @@ LICHESS_API_URL = "https://explorer.lichess.ovh/lichess"
 LICHESS_API_TIMEOUT = 3.0
 
 # Engine configuration
-STOCKFISH_DEPTH = 18
+STOCKFISH_DEPTH = 17
 STOCKFISH_ENGINE_PARAMETERS: Dict[str, str | int | bool] = {
     "Skill Level": 20,
     "Minimum Thinking Time": 30,
@@ -1186,7 +1186,7 @@ class ReviewSystem:
         """Initialize review system with all components"""
         # Engine thread-local storage for 2 workers
         self._local_data = threading.local()
-        
+
         # Initialize a main thread stockfish to detect perspective
         main_stockfish = self._initialize_stockfish()
         self._eval_perspective = self._detect_eval_perspective(main_stockfish)
@@ -1266,21 +1266,21 @@ class ReviewSystem:
             self._local_data.synced_history_len = 0
             self._local_data.synced_history = []
         return self._local_data.stockfish
-        
+
     @property
     def _synced_history_len(self) -> int:
         return getattr(self._local_data, 'synced_history_len', 0)
-        
+
     @_synced_history_len.setter
     def _synced_history_len(self, value: int):
         self._local_data.synced_history_len = value
-        
+
     @property
     def _synced_history(self) -> List[str]:
         if not hasattr(self._local_data, 'synced_history'):
             self._local_data.synced_history = []
         return self._local_data.synced_history
-        
+
     @_synced_history.setter
     def _synced_history(self, value: List[str]):
         self._local_data.synced_history = value
@@ -1968,12 +1968,12 @@ class ReviewSystem:
             (cp, mate, fen) tuple
         """
         cache_key = ",".join(history)
-        
+
         # Check cache first
         with self._lock:
             if cache_key in self._eval_cache:
                 return self._eval_cache[cache_key]
-        
+
         # Not in cache, compute it
         self._sync_review_engine_to_snapshot(history)
         evaluation = self.stockfish.get_evaluation()
@@ -1984,18 +1984,18 @@ class ReviewSystem:
         else:
             cp = ""
             mate = evaluation["value"]
-            
+
         try:
             fen = self.stockfish.get_fen_position()
         except Exception:
             fen = ""
-            
+
         result = (cp, mate, fen)
         
         # Save to cache
         with self._lock:
             self._eval_cache[cache_key] = result
-            
+
         return result
     
     def _parse_uci_move(self, move: str) -> Optional[Tuple[Tuple[int, int], Tuple[int, int], str]]:
@@ -2127,7 +2127,7 @@ class ReviewSystem:
             while len(self._pending_futures) < 2 and self._request_queue:
                 future = self._executor.submit(self._drain_evaluation_queue)
                 self._pending_futures.append(future)
-                
+
             # Clean up done futures
             self._pending_futures = [f for f in self._pending_futures if not f.done()]
 
@@ -2148,13 +2148,13 @@ class ReviewSystem:
                         break
                     else:
                         request = self._request_queue.popleft()
-                
+
                 if request is None:
                     # Defensive guard for static analyzers; runtime should not reach here.
                     continue
-                
+
                 self._log_queue(f"Review dequeue: move {request.move_count}, session {request.session_id}")
-                
+
                 with self._lock:
                     if request.session_id != self._session_id:
                         self._log_queue(
@@ -2162,7 +2162,7 @@ class ReviewSystem:
                             f"session {request.session_id} != {self._session_id}"
                         )
                         continue
-                
+
                 # Evaluate outside lock
                 self._evaluate_guarded(request)
         finally:

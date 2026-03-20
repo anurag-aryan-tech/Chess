@@ -1434,15 +1434,22 @@ class AIUtilities:
         """
         Initialize and load the Stockfish chess engine.
         """
-        path = "stockfish/stockfish-windows-x86-64-avx2.exe"
-        if os.path.exists(path):
-            stockfish = Stockfish(self.resource_path(path))
-            database.stockfish = stockfish
-            database.gamelogger.ai(
-                "Stockfish Added" if stockfish else "Failed to add Stockfish"
-            )
+        if os.name == 'posix':
+            path = "/usr/games/stockfish"
+            if os.path.exists(path):
+                stockfish = Stockfish(path)
+                database.stockfish = stockfish
+                database.gamelogger.ai("Stockfish Added" if stockfish else "Failed to add Stockfish")
+            else:
+                database.gamelogger.error("Stockfish not found!")
         else:
-            database.gamelogger.error("Stockfish not found!")
+            path = "stockfish/stockfish-windows-x86-64-avx2.exe"
+            if os.path.exists(path):
+                stockfish = Stockfish(self.resource_path(path))
+                database.stockfish = stockfish
+                database.gamelogger.ai("Stockfish Added" if stockfish else "Failed to add Stockfish")
+            else:
+                database.gamelogger.error("Stockfish not found!")
 
     def configure_strength(self, elo: int) -> None:
         """
@@ -1644,7 +1651,7 @@ class AIUtilities:
     def resource_path(relative_path):
         """Get the absolute path to a resource file."""
         if hasattr(sys, "_MEIPASS"):
-            return os.path.join(sys._MEIPASS, relative_path)
+            return os.path.join(sys._MEIPASS, relative_path) #type: ignore
         return os.path.join(os.path.abspath("."), relative_path)
 
 

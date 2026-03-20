@@ -102,7 +102,7 @@ LICHESS_API_URL = "https://explorer.lichess.ovh/lichess"
 LICHESS_API_TIMEOUT = 3.0
 
 # Engine configuration
-STOCKFISH_DEPTH = 17
+STOCKFISH_DEPTH = 16
 STOCKFISH_ENGINE_PARAMETERS: Dict[str, str | int | bool] = {
     "Skill Level": 20,
     "Minimum Thinking Time": 30,

@@ -102,7 +102,7 @@ LICHESS_API_URL = "https://explorer.lichess.ovh/lichess"
 LICHESS_API_TIMEOUT = 3.0
 
 # Engine configuration
-STOCKFISH_DEPTH = 16
+STOCKFISH_DEPTH = 15
 STOCKFISH_ENGINE_PARAMETERS: Dict[str, str | int | bool] = {
     "Skill Level": 20,
     "Minimum Thinking Time": 30,
@@ -1410,6 +1410,20 @@ class ReviewSystem:
         required = expected_moves + (1 if has_starting_eval else 0)
         return len(database.evaluation_history) >= required
 
+    def is_summary_ready(self) -> bool:
+       """For UI: checks if summary data is available to display."""
+       with self._lock:
+           queue_idle = not self._request_queue and self._active_workers == 0
+
+       if not queue_idle:
+           return False
+
+       # If queue is idle but summary not yet built, try to build it now
+       if not self.game_summary:
+           self.log_post_game_summary_if_ready()
+
+       return bool(self.game_summary)
+
     def _is_summary_ready(self) -> bool:
         """
         Check if post-game summary conditions are met.
@@ -2159,32 +2173,22 @@ class ReviewSystem:
     # ==================== ASYNC EVALUATION ====================
 
     def evaluate_last_move_async(self) -> None:
-        """
-        Queue non-blocking move evaluation.
-
-        Queues each move snapshot for ordered per-move evaluation.
-        Thread-safe.
-        """
         request = self._build_request_from_database()
         if request is None:
             return
 
         with self._lock:
-            # Duplicate suppression for repeated async calls on same move index.
             if request.move_count <= self._last_enqueued_move_count:
                 return
 
             self._request_queue.append(request)
             self._last_enqueued_move_count = request.move_count
-            self._log_queue(f"Review enqueue: move {request.move_count}, session {request.session_id}")
 
-            # Start worker if not already running. We have max_workers=2.
+            self._pending_futures = [f for f in self._pending_futures if not f.done()]
+
             while len(self._pending_futures) < 2 and self._request_queue:
                 future = self._executor.submit(self._drain_evaluation_queue)
                 self._pending_futures.append(future)
-
-            # Clean up done futures
-            self._pending_futures = [f for f in self._pending_futures if not f.done()]
 
     def _drain_evaluation_queue(self) -> None:
         """

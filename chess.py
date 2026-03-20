@@ -61,6 +61,7 @@ class STYLE_CONFIG:
     _DLG_WHITE = "#ffffff"
     _DLG_GRAY = "#888888"
     _DLG_BLUE = "#5b9bd5"
+    _DLG_RED = "#db0b0b"
     _DLG_YELLOW = "#d4a017"
     _DLG_GREEN_ACC = "#5faa3a"
     _DLG_ICON_BLUE = "#3a6da8"
@@ -248,6 +249,10 @@ class ChessGame:
 
         if self.vs_ai_menu and self.vs_ai_menu.winfo_exists():
             self._refresh_vs_ai_menu()
+
+        if hasattr(self, "game_over_menu") and self.game_over_menu and self.game_over_menu.winfo_exists():
+            self.game_over_menu.destroy()
+            self._show_game_over_dialog(self._last_game_result, self._last_game_winner)
 
         self.root.after(10, self._refresh_all_images)
 
@@ -1559,6 +1564,10 @@ class ChessGame:
         """
         Chess.com-style game-over card.
         """
+        # Save state for window resizing
+        self._last_game_result = result
+        self._last_game_winner = winner
+
         self._hide_footer_signature()
 
         # ── Full-window dark overlay ──────────────────────────────────────────
@@ -1566,14 +1575,18 @@ class ChessGame:
             self.root, fg_color=("gray50", "gray20"), bg_color="transparent"
         )
         overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+
+        # Track the overlay frame for the resize event
+        self.game_over_menu = overlay
+
         self._lift_persistent_widgets()
 
         sw = self.root.winfo_width()
         sh = self.root.winfo_height()
 
-        # ── Card sizing ───────────────────────────────────────────────────────
-        card_w = max(420, min(int(sw * 0.52), 620))
-        card_h = max(430, min(int(sh * 0.78), 560))
+        # ── Card sizing (Adjusted for better small-screen scaling) ────────────
+        card_w = max(360, min(int(sw * 0.52), 620))
+        card_h = max(380, min(int(sh * 0.85), 560)) # Lowered floor to 380
         scale = card_h / 520  # scale fonts/buttons proportionally
 
         # ── Card shadow ───────────────────────────────────────────────────────
@@ -1607,7 +1620,6 @@ class ChessGame:
             card, fg_color=self.style._DLG_HEADER_BG, corner_radius=14
         )
         header.pack(fill="x")
-        header.pack_propagate(False)
 
         # Build title / subtitle strings
         if result == "checkmate":
@@ -1666,50 +1678,115 @@ class ChessGame:
         ).pack(fill="x")
 
         # ── STAT BOXES ────────────────────────────────────────────────────────
-        # Pull real counts from the review system when available
-        try:
-            summary = self.review.get_summary()  # dict keyed by classification
-            great_count = summary.get("great", 0) + summary.get("good", 0)
-            best_count = summary.get("best", 0) + summary.get("brilliant", 0)
-            excellent_count = summary.get("excellent", 0)
-        except Exception:
-            great_count = best_count = excellent_count = 0
 
         stats_frame = ctk.CTkFrame(card, fg_color="transparent")
         stats_frame.pack(padx=20, pady=int(18 * scale), fill="x")
         stats_frame.columnconfigure((0, 1, 2), weight=1)
 
-        box_w = max(110, (card_w - 40 - 32) // 3)  # 3 boxes + 2 × 16 px gaps
-        box_h = max(90, int(108 * scale))
+        box_w = max(100, (card_w - 40 - 32) // 3)
+        box_h = max(80, int(108 * scale))
 
         images = self.classifier_images
 
-        stat_data = [
-            (
-                images["great"],
-                great_count,
-                "Great",
-                self.style._DLG_BLUE,
-            ),
-            (
-                images["best"],
-                best_count,
-                "Best",
-                self.style._DLG_YELLOW,
-            ),
-            (
-                images["excellent"],
-                excellent_count,
-                "Excellent",
-                self.style._DLG_GREEN_ACC,
-            ),
-        ]
+        # ── NEW ANIMATION CODE GOES HERE ──────────────────────────────────────
 
-        for col, (img, cnt, lbl, lbl_clr) in enumerate(stat_data):
-            b = self._make_stat_box(
-                stats_frame, img, str(cnt), lbl, lbl_clr, box_w, box_h
+        icon_labels = []
+        count_labels = []
+        type_labels = []
+
+        for col in range(3):
+            box = ctk.CTkFrame(
+                stats_frame,
+                fg_color=self.style._DLG_STAT_BG,
+                corner_radius=10,
+                width=box_w,
+                height=box_h,
             )
-            b.grid(row=0, column=col, padx=8, sticky="nsew")
+            box.grid(row=0, column=col, padx=4, sticky="nsew")
+            box.pack_propagate(False)
+            box.grid_propagate(False)
+
+            icon_lbl = ctk.CTkLabel(
+                box, text="", image=self.empty_image,
+                fg_color="transparent", bg_color="transparent"
+            )
+            icon_lbl.pack(pady=(12, 2))
+
+            count_lbl = ctk.CTkLabel(
+                box, text="-",
+                font=ctk.CTkFont("Helvetica", 19, "bold"),
+                text_color=self.style._DLG_WHITE,
+                fg_color="transparent",
+            )
+            count_lbl.pack()
+
+            type_lbl = ctk.CTkLabel(
+                box, text="Analyzing...",
+                font=ctk.CTkFont("Helvetica", 11, "bold"),
+                text_color=self.style._DLG_GRAY,
+                fg_color="transparent",
+            )
+            type_lbl.pack(pady=(0, 8))
+
+            icon_labels.append(icon_lbl)
+            count_labels.append(count_lbl)
+            type_labels.append(type_lbl)
+
+        animation_ticks = 0
+        all_icon_keys = list(images.keys())
+
+        def show_stats():
+            nonlocal animation_ticks
+
+            if not icon_labels[0].winfo_exists():
+                return
+
+            if animation_ticks < 4 or not self.review.is_summary_ready():
+                rng = np.random.default_rng()
+                random_choices = rng.choice(all_icon_keys, size=3, replace=False)
+
+                for i, choice in enumerate(random_choices):
+                    icon_labels[i].configure(image=images.get(choice, self.empty_image))
+                    count_labels[i].configure(text="-")
+                    type_labels[i].configure(
+                        text="Analyzing...", text_color=self.style._DLG_GRAY
+                    )
+
+                animation_ticks += 1
+                self.root.after(120, show_stats)
+
+            else:
+                if self.game_mode == "pass_n_play":
+                    color = winner if winner else "white"
+                else:
+                    color = self.vs_ai_configurations["color"] #type: ignore
+
+                summary_data = self.review.get_summary().get(color, {}).get("move_types", {})
+
+                data = []
+                for key, value in summary_data.items():
+                    if len(data) >= 3:
+                        break
+                    if int(value) > 0:
+                        if key.lower() in ["brilliant", "great"]:
+                            label_clr = self.style._DLG_BLUE
+                        elif key.lower() in ["best", "excellent", "good"]:
+                            label_clr = self.style._DLG_GREEN_ACC
+                        elif key.lower() in ["mistake", "inaccuracy"]:
+                            label_clr = self.style._DLG_YELLOW
+                        else:
+                            label_clr = self.style._DLG_RED
+                        data.append((images.get(key, self.empty_image), str(value), key.title(), label_clr))
+
+                while len(data) < 3:
+                    data.append((self.empty_image, "0", "-", self.style._DLG_GRAY))
+
+                for i, (img, cnt, lbl, lbl_clr) in enumerate(data):
+                    icon_labels[i].configure(image=img)
+                    count_labels[i].configure(text=cnt)
+                    type_labels[i].configure(text=lbl, text_color=lbl_clr)
+
+        show_stats()
 
         # ── BUTTONS ───────────────────────────────────────────────────────────
         btn_area = ctk.CTkFrame(card, fg_color="transparent")
@@ -1726,11 +1803,9 @@ class ChessGame:
             self.style._DLG_BTN_GREEN,
             self.style._DLG_GREEN_HOV,
             width=BW - s,
-            height=max(40, int(52 * scale)),
+            height=max(36, int(52 * scale)), # Lowered minimum height
             font_size=max(13, int(15 * scale)),
-            command=lambda: print(
-                "Game Review clicked"
-            ),  # wire up your review logic here
+            command=lambda: print("Game Review clicked"),
         ).pack(pady=(0, int(12 * scale)))
 
         # ── Rematch | New Game ────────────────────────────────────────────────
@@ -1738,7 +1813,7 @@ class ChessGame:
         row2.pack(fill="x", pady=(0, int(10 * scale)))
 
         hw = (BW - 10 - 2 * s) // 2
-        bh = max(36, int(46 * scale))
+        bh = max(32, int(46 * scale)) # Lowered minimum height
 
         self._make_result_btn(
             row2,
@@ -1769,7 +1844,7 @@ class ChessGame:
         row3.pack(fill="x")
 
         tw = (BW - 20 - 3 * s) // 3
-        tbh = max(34, int(44 * scale))
+        tbh = max(30, int(44 * scale)) # Lowered minimum height
 
         btn3 = [
             ("View Board", lambda: self._view_board_with_menu(overlay, result, winner)),
@@ -1797,6 +1872,7 @@ class ChessGame:
         self, overlay: ctk.CTkFrame, result: str, winner: Optional[str] = None
     ):
         """Hide dialog but keep overlay with floating menu button"""
+        self.game_over_menu = None
         overlay.destroy()
         self._show_footer_signature()
 
@@ -1894,6 +1970,7 @@ class ChessGame:
 
     def _start_new_game(self, overlay: ctk.CTkFrame) -> None:
             """Start a new game by resetting state"""
+            self.game_over_menu = None
             overlay.destroy()
             self._cancel_pending_ai_work()
 
@@ -1942,6 +2019,7 @@ class ChessGame:
 
     def _rematch_game(self, overlay: ctk.CTkFrame) -> None:
             """Rematch the last game by resetting state"""
+            self.game_over_menu = None
             overlay.destroy()
             self._cancel_pending_ai_work()
 
@@ -1990,8 +2068,6 @@ class ChessGame:
             elif self.game_mode == "pass_n_play":
                 self.disabled_color = [0, 0]
                 self._setup_pgn_metadata("Pass and Play", "Player 1", "Player 2", "-", "-")
-
-                # Fix 3: Restore the UI footer
                 self._show_footer_signature()
 
     def _execute_move(
@@ -2160,43 +2236,27 @@ class ChessGame:
         self.last_to_square = to_square
 
     def _delayed_legal_moves_update(self) -> None:
-        """Update legal moves after delay"""
         self.utils.legal_moves.update_legal_moves(database.matrix)
         self._legal_moves_update_scheduled = False
 
-        # Process pending move notation after legal moves are updated
         if hasattr(self, "_pending_move") and self._pending_move:
-            (
-                from_square,
-                to_square,
-                piece,
-                is_capture,
-                chess_notation,
-                stockfish_notation,
-            ) = self._pending_move
+            (from_square, to_square, piece, is_capture,
+             chess_notation, stockfish_notation) = self._pending_move
             self._pending_move = None
 
-            # Update notation if check/checkmate detected
-            game_over = self._check_game_over()
+            game_over = self._check_game_over()  # opens dialog internally — fix below
 
             if game_over == "checkmate":
                 chess_notation = self.utils.notations.chess_notation(
-                    piece,
-                    to_square,
-                    capture=is_capture,
-                    from_square=from_square,
-                    checkmate=True,
+                    piece, to_square, capture=is_capture,
+                    from_square=from_square, checkmate=True,
                 )
             elif self.utils.legal_moves.check_checker(database.current_turn):
                 chess_notation = self.utils.notations.chess_notation(
-                    piece,
-                    to_square,
-                    capture=is_capture,
-                    from_square=from_square,
-                    check=True,
+                    piece, to_square, capture=is_capture,
+                    from_square=from_square, check=True,
                 )
 
-            # Store in game history
             database.game_history.append(stockfish_notation)
             database.game_pgn.append(chess_notation)
             database.fen_history.append(
@@ -2204,21 +2264,22 @@ class ChessGame:
                     side_to_move=database.current_turn[0],
                     fullmove_number=database.fullmove,
                 )
-            )  # type: ignore
+            )
             self.current_fen += 1
             self.review.evaluate_last_move_async()
-
             database.gamelogger.move(f"Move: {chess_notation}")
-
-            # Update Stockfish with the move
             self.utils.ai.update_last_move()
 
-            # Trigger AI move if it's AI's turn
+            if game_over in ("checkmate", "stalemate"):
+                winner = None
+                if game_over == "checkmate":
+                    winner = "black" if database.current_turn == "white" else "white"
+                self._show_game_over_dialog(game_over, winner)
+                return
+
             if self.game_mode == "vs_ai" and self.vs_ai_configurations:
                 ai_color = (
-                    "black"
-                    if self.vs_ai_configurations["color"] == "white"
-                    else "white"
+                    "black" if self.vs_ai_configurations["color"] == "white" else "white"
                 )
                 if database.current_turn == ai_color:
                     self._execute_stockfish_move()
@@ -2233,7 +2294,6 @@ class ChessGame:
             self.flipped = False
 
     def _check_game_over(self) -> Optional[str]:
-        """Check if game is over (checkmate or stalemate)"""
         legal_moves_dict = (
             database.white_legal_moves
             if database.current_turn == "white"
@@ -2244,16 +2304,12 @@ class ChessGame:
         if total_moves == 0:
             if self.utils.legal_moves.check_checker(database.current_turn):
                 winner = "black" if database.current_turn == "white" else "white"
-                # Update PGN result
                 result = "1-0" if winner == "white" else "0-1"
                 termination = f"{winner.capitalize()} checkmated {('black' if winner == 'white' else 'white').capitalize()}"
                 self._update_pgn_result(result, termination)
-                self._show_game_over_dialog("checkmate", winner)
                 return "checkmate"
             else:
-                # Stalemate is a draw
                 self._update_pgn_result("1/2-1/2", "Stalemate")
-                self._show_game_over_dialog("stalemate")
                 return "stalemate"
 
     def _disable_color(self, color: Literal["white", "black"], pos: int = 0):

@@ -117,7 +117,7 @@ class ChessGame:
         self.flipped = False
         self.settings_open = False
         self.game_mode: Optional[str] = None
-        self.disabled_color: list = [0, 0]
+        self.disabled_colors: set = set()
         self.last_from_square = None
         self.last_to_square = None
         self.selected_square: Optional[tuple[int, int]] = None
@@ -883,7 +883,7 @@ class ChessGame:
 
         self._refresh_all_images(force=True)
 
-        self.disabled_color = ["black", "white"]
+        self.disabled_colors = {"black", "white"}
 
     def _reset_board_to_matrix(self) -> None:
         """Display the database matrix on the board with flipped if required"""
@@ -903,15 +903,14 @@ class ChessGame:
         self._refresh_all_images(force=True)
 
         if self.game_mode == "pass_n_play":
-            self.disabled_color = [0, 0]
+            self.disabled_colors = set()
         else:
-            self.disabled_color = [
+            self.disabled_colors = {
                 "white"
                 if self.vs_ai_configurations
                 and self.vs_ai_configurations.get("color") == "black"
-                else "black",
-                0,
-            ]
+                else "black"
+            }
 
         self.current_fen = len(database.fen_history) - 1
 
@@ -1382,33 +1381,23 @@ class ChessGame:
         self._refresh_all_images()
 
         # Generate notation with check/checkmate detection
-        if self._check_game_over() == "checkmate":
+        game_over_result = self._check_game_over()
+
+        if game_over_result == "checkmate":
             chess_notation = self.utils.notations.chess_notation(
-                "p",
-                to_square,
-                promotion=base,
-                capture=is_capture,
-                from_square=from_square,
-                checkmate=True,
+                "p", to_square, promotion=base,
+                capture=is_capture, from_square=from_square, checkmate=True,
+            )
+        elif self.utils.legal_moves.check_checker(database.current_turn):
+            chess_notation = self.utils.notations.chess_notation(
+                "p", to_square, promotion=base,
+                capture=is_capture, from_square=from_square, check=True,
             )
         else:
-            if self.utils.legal_moves.check_checker(database.current_turn):
-                chess_notation = self.utils.notations.chess_notation(
-                    "p",
-                    to_square,
-                    promotion=base,
-                    capture=is_capture,
-                    from_square=from_square,
-                    check=True,
-                )
-            else:
-                chess_notation = self.utils.notations.chess_notation(
-                    "p",
-                    to_square,
-                    promotion=base,
-                    capture=is_capture,
-                    from_square=from_square,
-                )
+            chess_notation = self.utils.notations.chess_notation(
+                "p", to_square, promotion=base,
+                capture=is_capture, from_square=from_square,
+            )
 
         stockfish_notation = self.utils.notations.stockfish_notation(
             from_square, to_square, promotion=base
@@ -1423,7 +1412,7 @@ class ChessGame:
             )
         )  # type: ignore
         self.current_fen = len(database.fen_history) - 1
-        self.review.evaluate_last_move_async()
+        self.review.evaluate_last_move_async(is_checkmate=(game_over_result == "checkmate"))
 
         database.gamelogger.move(f"Move: {chess_notation}")
 
@@ -1732,6 +1721,9 @@ class ChessGame:
         def show_stats():
             nonlocal animation_ticks
 
+            if not self.root.winfo_exists():
+                    return
+
             if not icon_labels[0].winfo_exists():
                 return
 
@@ -1987,9 +1979,7 @@ class ChessGame:
             self.last_from_square = None
             self.last_to_square = None
 
-            # --- THE FIX ---
-            # Explicitly unfreeze the board colors before returning to the start menu
-            self.disabled_color = [0, 0]
+            self.disabled_colors = set()
 
             self.view_matrix = database.matrix
             self._current_legal_visual_squares.clear()
@@ -2060,7 +2050,7 @@ class ChessGame:
                 self._start_ai_game(None)
 
             elif self.game_mode == "pass_n_play":
-                self.disabled_color = [0, 0]
+                self.disabled_colors = set()
                 self._setup_pgn_metadata("Pass and Play", "Player 1", "Player 2", "-", "-")
                 self._show_footer_signature()
 
@@ -2270,7 +2260,7 @@ class ChessGame:
                 )
             )
             self.current_fen += 1
-            self.review.evaluate_last_move_async()
+            self.review.evaluate_last_move_async(is_checkmate=(game_over == "checkmate"))
             database.gamelogger.move(f"Move: {chess_notation}")
             self.utils.ai.update_last_move()
 
@@ -2316,9 +2306,9 @@ class ChessGame:
                 self._update_pgn_result("1/2-1/2", "Stalemate")
                 return "stalemate"
 
-    def _disable_color(self, color: Literal["white", "black"], pos: int = 0):
-        if not self.game_mode == "pass_n_play":
-            self.disabled_color[pos] = color
+    def _disable_color(self, color: Literal["white", "black"]) -> None:
+        if self.game_mode != "pass_n_play":
+            self.disabled_colors.add(color)
 
     # ==================== setTINGS OVERLAY ====================
 
@@ -2480,8 +2470,7 @@ class ChessGame:
     def _handle_square_click(self, visual_square: tuple[int, int]) -> None:
         if (
             self.promoting
-            or self.disabled_color is None
-            or database.current_turn in self.disabled_color
+            or database.current_turn in self.disabled_colors
         ):
             return
         # Block clicks while viewing history

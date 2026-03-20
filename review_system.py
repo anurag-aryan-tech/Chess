@@ -33,7 +33,6 @@ is converted to a probability-like value (0.0 to 1.0) representing winning chanc
 """
 
 import math
-import requests
 from collections import deque
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -97,12 +96,8 @@ REVIEW_DEBUG = False
 BRILLIANT_GREAT_GAP_THRESHOLD = 100  # Centipawns gap for "Great" moves
 BRILLIANT_SACRIFICE_KING_PRESSURE = 2  # Attackers needed for king pressure
 
-# API configuration
-LICHESS_API_URL = "https://explorer.lichess.ovh/lichess"
-LICHESS_API_TIMEOUT = 3.0
-
 # Engine configuration
-STOCKFISH_DEPTH = 15
+STOCKFISH_DEPTH = 16
 STOCKFISH_ENGINE_PARAMETERS: Dict[str, str | int | bool] = {
     "Skill Level": 20,
     "Minimum Thinking Time": 30,
@@ -181,86 +176,54 @@ class ReviewRequest:
 
 class OpeningBook:
     """
-    Manages opening detection using Lichess API and fallback heuristics.
+    Manages opening detection using a local ECO database.
     """
-
-    # First move opening names (fallback when API unavailable)
-    FIRST_MOVE_NAMES = {
-        "e2e4": "King's Pawn Opening",
-        "d2d4": "Queen's Pawn Opening",
-        "c2c4": "English Opening",
-        "g1f3": "Réti Opening",
-        "b1c3": "Van't Kruijs Opening",
-        "b2b3": "Larsen's Opening",
-        "g2g3": "King's Fianchetto Opening",
-        "f2f4": "Bird's Opening",
-        "e2e3": "Van't Kruijs Opening",
-        "d2d3": "Mieses Opening",
-        "b2b4": "Polish Opening",
-        "g2g4": "Grob's Attack",
-        "a2a3": "Anderssen's Opening",
-        "h2h3": "Clemenz Opening",
-        "a2a4": "Ware Opening",
-        "h2h4": "Kadas Opening",
-        "c2c3": "Saragossa Opening",
-        "f2f3": "Barnes Opening",
-        "g1h3": "Amar Opening",
-        "b1a3": "Sodium Attack",
-    }
-
-    _api_cache: Dict[str, Optional[str]] = {}
+    _db: Dict[str, str] = {}
+    _loaded: bool = False
 
     @classmethod
-    def get_opening_from_api(cls, fen: str, play: str = "") -> Tuple[bool, Optional[str]]:
-        """
-        Query Lichess API for opening name.
-        Uses in-memory caching to avoid duplicate requests.
-
-        Args:
-            fen: Position in FEN format
-            play: Moves from starting position (comma-separated, e.g., 'e2e4,e7e5')
-
-        Returns:
-            (success, opening_name):
-                success is True if API responded properly (even if no opening found)
-                opening_name is the name if found, None otherwise
-        """
-        cache_key = play if play else fen
-        if cache_key in cls._api_cache:
-            return True, cls._api_cache[cache_key]
-
+    def load(cls) -> None:
+        """Load the ECO database from disk once."""
+        if cls._loaded:
+            return
         try:
-            # Prefer 'play' parameter for more reliable opening detection
-            params = {"play": play} if play else {"fen": fen}
-            response = requests.get(
-                LICHESS_API_URL,
-                params=params,
-                timeout=LICHESS_API_TIMEOUT
-            )
-
-            if response.status_code == 200:
-                data = response.json()
-                opening = data.get("opening")
-                opening_name = opening.get("name") if isinstance(opening, dict) else None
-                cls._api_cache[cache_key] = opening_name
-                return True, opening_name
-            return False, None
+            import json
+            with open("eco_database.json", "r", encoding="utf-8") as f:
+                cls._db = json.load(f)
+            cls._loaded = True
+            database.gamelogger.init(f"ECO database loaded ({len(cls._db)} openings)")
         except Exception as e:
-            # Network error or timeout (silently fail)
-            return False, None
+            database.gamelogger.error(f"Failed to load ECO database: {e}")
+            cls._db = {}
+            cls._loaded = True
 
     @classmethod
-    def get_first_move_name(cls, move: str) -> str:
+    def lookup(cls, history: List[str]) -> Optional[str]:
         """
-        Get opening name for first move (fallback).
+        Look up opening name for the current move sequence.
 
         Args:
-            move: First move in UCI format (e.g., 'e2e4')
+            history: List of UCI moves from the start (e.g. ['e2e4', 'e7e5'])
 
         Returns:
-            Opening name or generic "First Move"
+            Opening name if found, None otherwise
         """
-        return cls.FIRST_MOVE_NAMES.get(move, "First Move")
+        if not cls._loaded:
+            cls.load()
+        key = ",".join(history)
+        return cls._db.get(key, None)
+
+    @classmethod
+    def is_in_book(cls, history: List[str]) -> bool:
+        """
+        Check if any known opening starts with this move sequence.
+        Used to keep _opening_active = True even for unnamed intermediate moves.
+        """
+        if not cls._loaded:
+            cls.load()
+        key = ",".join(history)
+        # Exact match OR any opening starts with this prefix
+        return any(k == key or k.startswith(key + ",") for k in cls._db)
 
 
 # ==================== EXPECTED POINTS CALCULATOR ====================
@@ -1207,7 +1170,6 @@ class ReviewSystem:
         self._eval_cache: Dict[str, Tuple[int | float | str, int | float | str, str]] = {}
 
         self._opening_active: bool = True
-        self._api_failure_count: int = 0
 
         # Utility components
         self.notation_gen = NotationGenerator()
@@ -1216,6 +1178,8 @@ class ReviewSystem:
         self.accuracy_calc = AccuracyCalculator()
         self.board_analyzer = BoardAnalyzer()
         self.move_classifier = MoveClassifier(self.board_analyzer, self.opening_book)
+
+        OpeningBook.load()
 
         database.gamelogger.init(f"Review system initialized (eval perspective: {self._eval_perspective})")
 
@@ -1233,7 +1197,6 @@ class ReviewSystem:
             self._eval_cache.clear()
 
         self._opening_active = True
-        self._api_failure_count = 0
 
     # ==================== STOCKFISH MANAGEMENT ====================
 
@@ -1357,12 +1320,7 @@ class ReviewSystem:
         """
         self._sync_review_engine_to_snapshot(list(database.game_history))
 
-    @staticmethod
-    def _is_checkmate_from_legal_moves() -> bool:
-        legal_moves = database.get_legal_moves(database.current_turn)
-        return sum(len(moves) for moves in legal_moves.values()) == 0
-
-    def _build_request_from_database(self) -> Optional[ReviewRequest]:
+    def _build_request_from_database(self, is_checkmate: bool = False) -> Optional[ReviewRequest]:
         """Snapshot current board/move state for deterministic async review."""
         history = list(database.game_history)
         if not history:
@@ -1380,7 +1338,7 @@ class ReviewSystem:
             current_turn=database.current_turn,
             fullmove=database.fullmove,
             last_forced=database.last_forced,
-            is_checkmate_after_move=self._is_checkmate_from_legal_moves(),
+            is_checkmate_after_move=is_checkmate,  # passed in directly now
         )
 
     @staticmethod
@@ -1698,73 +1656,41 @@ class ReviewSystem:
         history: List[str]
     ) -> Optional[Dict]:
         """
-        Check if move is in opening book.
+        Check if move is in the local ECO opening database.
 
         Returns:
             Evaluation dict if book move, None otherwise
         """
-        # Once opening is broken, never return to book in this game.
         if not self._opening_active:
             return None
 
-        play_string = ",".join(history)
+        opening = self.opening_book.lookup(history)
 
-        # First move is always book (with fallback name)
-        if move_count == 1:
-            self._opening_active = True
-            success, opening = self.opening_book.get_opening_from_api(fen, play=play_string)
-            if not opening:
-                opening = self.opening_book.get_first_move_name(last_move)
-
-            eval_data = EvaluationData(
+        if opening:
+            # Named opening found — definite book move
+            return EvaluationData(
                 color=color,
                 cp=cp,
                 mate=mate,
                 move_type="book",
                 accuracy="",
                 opening=opening,
-                book_source="forced_first_move"
-            )
-            return eval_data.to_dict()
+            ).to_dict()
 
-        # API-only policy after move 1.
-        success, opening = self.opening_book.get_opening_from_api(fen, play=play_string)
-
-        if success:
-            # API responded successfully
-            if opening:
-                eval_data = EvaluationData(
-                    color=color,
-                    cp=cp,
-                    mate=mate,
-                    move_type="book",
-                    accuracy="",
-                    opening=opening,
-                    book_source="api"
-                )
-                return eval_data.to_dict()
-            else:
-                # API responded, but genuinely out of book. Close opening phase permanently.
-                self._opening_active = False
-                return None
-        else:
-            # API failed (timeout/network). Don't close book permanently yet.
-            self._api_failure_count += 1
-            if self._api_failure_count >= 3:
-                self._opening_active = False
-
-            # Since we don't know if it's a book move, return a fallback "book" to avoid
-            # misclassifying an opening move as "best" or "blunder".
-            eval_data = EvaluationData(
+        if self.opening_book.is_in_book(history):
+            # Sequence is a known prefix (unnamed intermediate move) — still book
+            return EvaluationData(
                 color=color,
                 cp=cp,
                 mate=mate,
                 move_type="book",
                 accuracy="",
-                opening="Opening Move",
-                book_source="fallback"
-            )
-            return eval_data.to_dict()
+                opening=None,
+            ).to_dict()
+
+        # Not in database at all — opening phase is over
+        self._opening_active = False
+        return None
 
     def _evaluate_with_engine(
         self,
@@ -2155,8 +2081,8 @@ class ReviewSystem:
 
     # ==================== ASYNC EVALUATION ====================
 
-    def evaluate_last_move_async(self) -> None:
-        request = self._build_request_from_database()
+    def evaluate_last_move_async(self, is_checkmate: bool = False) -> None:
+        request = self._build_request_from_database(is_checkmate=is_checkmate)
         if request is None:
             return
 

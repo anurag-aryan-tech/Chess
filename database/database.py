@@ -46,12 +46,8 @@ class GameStateManager:
     Ensures atomic, consistent updates to the game state.
     All move validation and state updates happen here.
     """
-    database: 'Database' = field(init=False)
-
-    def __call__(self, db: 'Database') -> 'GameStateManager':
-        """Initialize with database reference (allows for delayed binding)"""
-        self.database = db
-        return self
+    def __init__(self, db: 'Database') -> None:
+            self.database = db
 
     def execute_move(
         self,
@@ -91,10 +87,7 @@ class GameStateManager:
             ep_val = self.database.matrix[from_square[0], to_square[1]]
             ep_captured_pawn = ep_val if ep_val != 0 and isinstance(ep_val, str) else None
 
-        if self._check_ambiguity(to_square, base_piece):
-            disambiguation = chr(ord('a') + from_square[1])
-        else:
-            disambiguation = ""
+        disambiguation = self._get_disambiguation(to_square, from_square, base_piece)
 
         # Create result object
         result = MoveResult(
@@ -149,26 +142,69 @@ class GameStateManager:
         target = self.database.matrix[to_square[0], to_square[1]]
         return target != 0 and isinstance(target, str)
 
-    def _check_ambiguity(self, to_square: Tuple[int, int], base_piece: Optional[str]) -> bool:
-        """Check if the move is ambiguous"""
-        if self.database.current_turn == "white":
-            legal_moves = self.database.white_legal_moves
-        else:
-            legal_moves = self.database.black_legal_moves
+    def _get_disambiguation(
+        self,
+        to_square: Tuple[int, int],
+        from_square: Tuple[int, int],
+        base_piece: Optional[str]
+    ) -> str:
+        """
+        Return the minimal disambiguation string per PGN standard:
+        - ""        if no other piece of same type can reach to_square
+        - file      if pieces are on different files
+        - rank      if pieces are on the same file
+        - full sq   if neither file nor rank alone disambiguates
+        """
+        if not base_piece:
+            return ""
 
-        piece_count = 0
+        legal_moves = (
+            self.database.white_legal_moves
+            if self.database.current_turn == "white"
+            else self.database.black_legal_moves
+        )
+
+        # Collect from_squares of all same-type pieces that can reach to_square
+        ambiguous_from_squares: List[Tuple[int, int]] = []
 
         for piece, moves in legal_moves.items():
-            if not isinstance(piece, str) or not base_piece:
+            if not isinstance(piece, str):
                 continue
-
             piece_type = piece[1] if piece.startswith("-") else piece[0]
-            if piece_type.lower() == base_piece.lower():
-                if any(np.array_equal(to_square, move) for move in moves):
-                    piece_count += 1
-                    if piece_count > 1:
-                        return True
-        return False
+            if piece_type.lower() != base_piece.lower():
+                continue
+            if any(np.array_equal(to_square, move) for move in moves):
+                try:
+                    pos = self.database.white_legal_moves  # just to find position
+                    # find the actual square this piece is on
+                    result = np.where(self.database.matrix == piece)
+                    if len(result[0]) > 0:
+                        ambiguous_from_squares.append(
+                            (int(result[0][0]), int(result[1][0]))
+                        )
+                except Exception:
+                    continue
+
+        # Only one piece can reach to_square — no disambiguation needed
+        if len(ambiguous_from_squares) <= 1:
+            return ""
+
+        from_file = from_square[1]
+        from_rank = from_square[0]
+
+        files = [sq[1] for sq in ambiguous_from_squares]
+        ranks = [sq[0] for sq in ambiguous_from_squares]
+
+        # Files are all different — use file
+        if files.count(from_file) == 1:
+            return chr(ord('a') + from_file)
+
+        # Files not unique but ranks are — use rank
+        if ranks.count(from_rank) == 1:
+            return str(8 - from_rank)
+
+        # Neither unique — use full square
+        return chr(ord('a') + from_file) + str(8 - from_rank)
 
     def _update_board(self, from_square: Tuple[int, int], to_square: Tuple[int, int], result: MoveResult) -> None:
         """Update board matrix for the move"""
@@ -459,7 +495,7 @@ class Database:
         self.gamelogger = gamelogger
 
         # Game state manager - centralized move execution
-        self.state_manager = GameStateManager()(self)
+        self.state_manager = GameStateManager(self)
 
         # Game state
         self.current_turn: Literal["white", "black"] = "white"
@@ -500,7 +536,7 @@ class Database:
         self.fen_history: List[str] = ["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"]
 
         # Evaluation
-        self.evaluation_history: List[Dict[str, int|str|float]] = []
+        self.evaluation_history: list = []
         self.last_forced: bool = False
 
         self.ai_total_moves: int = 0
@@ -577,7 +613,7 @@ class Database:
         self.fullmove = 1
 
         # Reinitialize state manager
-        self.state_manager = GameStateManager()(self)
+        self.state_manager = GameStateManager(self)
 
         # Reset castling flags
         self.r1_moved = False
@@ -604,7 +640,7 @@ class Database:
         self.fen_history = ["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"]
 
         # Reset evaluation history
-        self.evaluation_history: List[Dict[str, int|str|float]] = []
+        self.evaluation_history: list = []
 
         # Clear caches
         self.white_legal_moves.clear()

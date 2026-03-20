@@ -583,47 +583,6 @@ class LegalMovesEngine:
 
     # ==================== CHECK DETECTION ====================
 
-    def opponent_legal_search(
-        self,
-        color: Literal["white", "black"],
-        coordinates: Tuple[int, int],
-        matrix: Optional[np.ndarray] = None,
-        return_piece: bool = False,
-    ) -> bool | List[str]:
-        """
-        Check if opponent can attack a square.
-
-        Args:
-            color: Current player color
-            coordinates: Square to check
-            matrix: Board state
-            return_piece: If True, return list of attacking pieces
-
-        Returns:
-            True if square is under attack, or list of attacking pieces
-        """
-        if matrix is None:
-            matrix = database.matrix
-
-        moves = (
-            database.white_legal_moves.items()
-            if color == "black"
-            else database.black_legal_moves.items()
-        )
-        pieces = []
-
-        for piece, move in moves:
-            if len(move) == 0:
-                continue
-
-            if np.any(np.all(move == coordinates, axis=1)):
-                if return_piece:
-                    pieces.append(piece)
-                else:
-                    return True
-
-        return pieces if return_piece else False
-
     def check_checker(
         self, color: Literal["white", "black"], matrix: Optional[np.ndarray] = None
     ) -> bool:
@@ -632,9 +591,10 @@ class LegalMovesEngine:
             matrix = database.matrix
 
         king = "k1" if color == "white" else "-k1"
+        opponent_color = "black" if color == "white" else "white"
         try:
             king_pos = self.search_piece(king, matrix)
-            return self.opponent_legal_search(color, king_pos, matrix)  # type: ignore
+            return self._is_square_attacked_by_any_piece(king_pos, opponent_color, matrix)
         except ValueError:
             return False
 
@@ -653,30 +613,41 @@ class LegalMovesEngine:
             matrix = database.matrix
 
         king = "k1" if color == "white" else "-k1"
+        opponent_color = "black" if color == "white" else "white"
+
         try:
-            king_coordinates = self.search_piece(king, matrix)
+            king_pos = self.search_piece(king, matrix)
         except ValueError:
             return True
 
-        pieces = self.opponent_legal_search(
-            color, king_coordinates, matrix, return_piece=True
-        )
+        # Find all pieces attacking the king via fresh board scan
+        attacking_pieces = []
+        for r in range(8):
+            for c in range(8):
+                attacker = matrix[r, c]
+                if attacker == 0 or not isinstance(attacker, str):
+                    continue
+                attacker_color = "black" if "-" in attacker else "white"
+                if attacker_color != opponent_color:
+                    continue
+                if "k" in attacker.strip("-"):
+                    continue
+                if self._can_piece_attack(attacker, (r, c), king_pos, matrix):
+                    attacking_pieces.append(attacker)
 
-        if not pieces or isinstance(pieces, bool):
+        if not attacking_pieces:
             return True
 
-        if len(pieces) >= 2:
-            return []  # Double check
+        if len(attacking_pieces) >= 2:
+            return []  # Double check — only king can move
 
-        piece = pieces[0]
+        piece = attacking_pieces[0]
         piece_pos = self.search_piece(piece, matrix)
 
-        # Knights and pawns can only be captured
         if "n" in piece or "p" in piece:
             return [piece_pos]
 
-        # Sliding pieces can be blocked
-        return self._calculate_blocking_squares(piece, piece_pos, king_coordinates)
+        return self._calculate_blocking_squares(piece, piece_pos, king_pos)
 
     def _calculate_blocking_squares(
         self, piece: str, piece_pos: Tuple[int, int], king_pos: Tuple[int, int]
@@ -1710,22 +1681,6 @@ class Utilities:
     def reset(self) -> None:
         """Reset utilities"""
         self.legal_moves = LegalMovesEngine()
-
-    def flip_legal(self, moves_dict: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-        """Flip legal moves for black player"""
-        flipped = {}
-
-        for piece, moves in moves_dict.items():
-            if moves.size == 0:
-                flipped[piece] = moves
-                continue
-
-            new_moves = []
-            for move in moves:
-                new_moves.append((7 - move[0], move[1]))
-            flipped[piece] = np.array(new_moves)
-
-        return flipped
 
     def create_selector_frame(
         self,

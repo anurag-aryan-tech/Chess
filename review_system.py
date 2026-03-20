@@ -1532,23 +1532,10 @@ class ReviewSystem:
                 f"{color.capitalize()} move types: {', '.join(ordered_parts) or 'none'}"
             )
 
-            database.gamelogger.game(f"{color.capitalize()} average accuracy: {avg_text}")
-
-            present_types = stats[color]["types"]
-            ordered_parts = [
-                f"{move_type}:{present_types[move_type]}"
-                for move_type in type_order
-                if present_types[move_type] > 0
-            ]
-            if not ordered_parts:
-                ordered_parts = ["none"]
-
-            database.gamelogger.game(
-                f"{color.capitalize()} move types: {', '.join(ordered_parts)}"
-            )
-
-    def get_summary(self):
-        return self.game_summary
+    def get_summary(self) -> dict:
+        """Return a stable copy of the game summary."""
+        with self._lock:
+            return dict(self.game_summary)
 
     # ==================== EVALUATION METHODS ====================
 
@@ -2151,24 +2138,20 @@ class ReviewSystem:
                 pass
 
     def _update_evaluation_history(self, force_append: bool = False) -> None:
-        """
-        Update database evaluation history with current evaluation.
-
-        Avoids duplicates.
-        """
-        db_eval = database.evaluation_history
+        """Update database evaluation history with current evaluation."""
         curr_eval = dict(self.curr_eval)
 
-        # Initialize history if empty
-        if not db_eval:
+        with self._lock:
+            db_eval = database.evaluation_history
+
+            if not db_eval:
+                db_eval.append(curr_eval)
+                return
+
+            if not force_append and curr_eval == db_eval[-1]:
+                return
+
             db_eval.append(curr_eval)
-            return
-
-        # Don't add duplicates
-        if not force_append and curr_eval == db_eval[-1]:
-            return
-
-        db_eval.append(curr_eval)
 
     # ==================== ASYNC EVALUATION ====================
 

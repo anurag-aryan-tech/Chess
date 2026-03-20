@@ -118,7 +118,6 @@ class ChessGame:
         self.settings_open = False
         self.game_mode: Optional[str] = None
         self.disabled_color: list = [0, 0]
-        self.stockfish_chance: bool = False
         self.last_from_square = None
         self.last_to_square = None
         self.selected_square: Optional[tuple[int, int]] = None
@@ -1213,10 +1212,15 @@ class ChessGame:
 
             self._flip_board(color)
             self._disable_color(color2)
-            self.stockfish_chance = database.current_turn == color2
             self.root.after(10, self._refresh_all_images)
 
             database.gamelogger.game(f"VS AI | ELO: {elo} | Color: {color}")
+
+            white_name = "Player" if color == "white" else f"Stockfish ({elo})"
+            black_name = "Player" if color == "black" else f"Stockfish ({elo})"
+            white_elo = "-" if color == "white" else str(elo)
+            black_elo = "-" if color == "black" else str(elo)
+            self._setup_pgn_metadata("VS AI", white_name, black_name, white_elo, black_elo)
 
             # Configure AI and RESET its memory
             if database.stockfish is None:
@@ -1229,7 +1233,7 @@ class ChessGame:
             self.utils.ai.configure_strength(elo)
             self._cancel_pending_ai_work()
 
-            if self.stockfish_chance:
+            if color == "black":
                 self._execute_stockfish_move()
 
     def _create_vs_ai_start_button(
@@ -1298,38 +1302,28 @@ class ChessGame:
         return logical_square
 
     def _start_promotion(
-        self,
-        color: str,
-        target_square: tuple[int, int],
-        from_square: tuple[int, int],
-        base: Optional[str] = None,
-    ) -> None:
-        """Start pawn promotion process and handle state changes"""
-        piece = database.matrix[from_square[0], from_square[1]]
+       self,
+       color: str,
+       target_square: tuple[int, int],
+       from_square: tuple[int, int],
+       base: Optional[str] = None,
+   ) -> None:
+       piece = database.matrix[from_square[0], from_square[1]]
 
-        # Update game state for the pawn move
-        database.matrix[from_square[0], from_square[1]] = 0
-        database.current_turn = "black" if database.current_turn == "white" else "white"
-        if database.current_turn == "white":
-            database.fullmove += 1
+       database.matrix[from_square[0], from_square[1]] = 0
+       database.current_turn = "black" if database.current_turn == "white" else "white"
+       if database.current_turn == "white":
+           database.fullmove += 1
 
-        # Clear en passant and last pawn tracking
-        if "-" in piece:
-            database.black_last_pawn = None
-            database.black_pieces = database.black_pieces[
-                database.black_pieces != piece
-            ]
-        else:
-            database.white_last_pawn = None
-            database.white_pieces = database.white_pieces[
-                database.white_pieces != piece
-            ]
+       if "-" in piece:
+           database.black_last_pawn = None
+           database.black_pieces = database.black_pieces[database.black_pieces != piece]
+       else:
+           database.white_last_pawn = None
+           database.white_pieces = database.white_pieces[database.white_pieces != piece]
 
-        # If promotion choice is known (e.g., from AI), proceed directly
-        if not self.stockfish_chance or base is None:
-            self._setup_promotion_images(color)
-        else:
-            self._end_promotion(base)
+       # Always show the UI — AI promotions are handled before this is called
+       self._setup_promotion_images(color)
 
     def _end_promotion(self, base: str) -> None:
         """Finalize pawn promotion by placing the promoted piece"""
@@ -2104,18 +2098,28 @@ class ChessGame:
 
         # Check if this is a pawn promotion that requires user input
         if "p" in piece and to_square[0] in [0, 7]:
-            # For promotion: switch turn first, then enter promotion UI
             promotion_color = "black" if "-" in piece else "white"
 
-            # set promotion state
             self.promoting = True
             self.promoting_square = to_square
             self.promotion_from_square = from_square
 
             if self.game_mode == "vs_ai" and self.vs_ai_configurations and database.current_turn != self.vs_ai_configurations["color"]:
                 if base_piece is not None:
+                    database.matrix[from_square[0], from_square[1]] = 0
+                    database.current_turn = "black" if database.current_turn == "white" else "white"
+                    if database.current_turn == "white":
+                        database.fullmove += 1
+                    if "-" in piece:
+                        database.black_last_pawn = None
+                        database.black_pieces = database.black_pieces[database.black_pieces != piece]
+                    else:
+                        database.white_last_pawn = None
+                        database.white_pieces = database.white_pieces[database.white_pieces != piece]
+
                     self._end_promotion(base_piece)
                     return True
+
             self._start_promotion(promotion_color, to_square, from_square, base_piece)
             return True
 
